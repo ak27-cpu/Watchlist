@@ -140,7 +140,7 @@ if tickers:
         r = df[df['Ticker'] == sel].iloc[0]
 
         perp_prompt = f"""Du bist renommierter Analyst. Analysiere {sel} ({r['Ticker']}): 
-Kurs {r['Preis']}, Fair Value {r['Fair Value']}, RSI {r['RSI']}, Korrektur {r['Korr. ATH %']}% (Schnitt {r['Ø Korr %']}%).
+Kurs {r['Preis']}, RSI {r['RSI']}, Korrektur {r['Korr. ATH %']}% (Schnitt {r['Ø Korr %']}%).
 1. Kurz-Statement zu News & Marktstellung.
 2. Fair Value Check (Aktienfinder-Style) & KGV/Cashflow-Bewertung.
 3. Korrektur-Einordnung vs. Historie.
