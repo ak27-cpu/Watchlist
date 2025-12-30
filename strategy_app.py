@@ -133,9 +133,21 @@ if tickers:
             ), use_container_width=True, hide_index=True
         )
 
-    # --- 5. PERPLEXITY LINK ---
-    st.divider()
-    sel = st.selectbox("Deep-Dive Analyse wählen:", df['Ticker'].tolist())
-    r = df[df['Ticker'] == sel].iloc[0]
-    perp_prompt = f"Analysiere {sel}. Kurs {r['Preis']}, Fair Value {r['Fair Value']}, RSI {r['RSI']}. Aktuelle Korrektur {r['Korr. ATH %']}% vs Ø {r['Ø Korr %']}%. Einschätzung?"
-    st.link_button(f"🚀 {sel} auf Perplexity prüfen", f"https://www.perplexity.ai/?q={quote(perp_prompt)}", use_container_width=True)
+   # --- 5. OPTIMIERTER PERPLEXITY PRO LINK ---
+st.divider()
+st.subheader("🔍 Experten-Analyse (Professional Prompt)")
+sel = st.selectbox("Aktie für Deep-Dive wählen:", df['Ticker'].tolist())
+r = df[df['Ticker'] == sel].iloc[0]
+
+# Der perfekt konfigurierte Prompt für die URL
+perp_prompt = f"""Du bist renommierter Analyst. Analysiere {sel} ({r['Ticker']}): 
+Kurs {r['Preis']}, Fair Value {r['Fair Value']}, RSI {r['RSI']}, Korrektur {r['Korr. ATH %']}% (Schnitt {r['Ø Korr %']}%).
+1. Kurz-Statement zu News & Marktstellung.
+2. Fair Value Check (Aktienfinder-Style) & KGV/Cashflow-Bewertung.
+3. Korrektur-Einordnung vs. Historie.
+4. Kaufzonen-Urteil: Warum JETZT investieren?
+5. Ausblick & Renditeerwartung für 2026."""
+
+url = f"https://www.perplexity.ai/?q={quote(perp_prompt)}"
+
+st.link_button(f"🚀 {sel} Experten-Analyse starten", url, use_container_width=True)
