@@ -116,7 +116,7 @@ if tickers:
                 diff_fv = ((d['Preis'] / d['FV']) - 1) * 100
                 
                 # Strenge Empfehlung: Kaufen erst ab 20% Discount zum strengen FV
-                if diff_fv < -20:
+                if diff_fv < -10:
                     rec, priority = "KAUFEN 🟢", 1
                 elif diff_fv < 0:
                     rec, priority = "BEOBACHTEN 🟡", 2
