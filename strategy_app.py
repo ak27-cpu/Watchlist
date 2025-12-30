@@ -5,7 +5,7 @@ import pandas as pd
 from urllib.parse import quote
 
 # --- 1. SETUP & SIDEBAR ---
-st.set_page_config(page_title="FairValue Watchlist v3 - Deep Analysis", layout="wide")
+st.set_page_config(page_title="FairValue Watchlist v4.1", layout="wide")
 
 with st.sidebar:
     st.header("⚙️ Strategie-Einstellungen")
@@ -33,7 +33,6 @@ def calculate_smart_fv(ticker):
         fcf = info.get('freeCashflow', 0)
         shares = info.get('sharesOutstanding', 1)
         
-        # Graham Formel & Cashflow Multiplikator
         fv_graham = eps * (8.5 + 2 * (growth * 100)) if eps > 0 else 0
         fv_fcf = (fcf / shares) * 20 if fcf and shares else 0
         
@@ -50,19 +49,17 @@ def calculate_smart_fv(ticker):
 def get_extended_data(ticker):
     try:
         s = yf.Ticker(ticker)
-        h = s.history(period="3y") # 3 Jahre für Durchschnittskorrektur
+        h = s.history(period="3y")
         if h.empty: return None
         
         info = s.info
         cp = h['Close'].iloc[-1]
         ath = h['High'].max()
         
-        # Korrektur-Statistik
         curr_corr = ((cp / ath) - 1) * 100
         roll_max = h['High'].cummax()
         avg_corr = ((h['Low'] - roll_max) / roll_max).mean() * 100
 
-        # RSI
         delta = h['Close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -96,9 +93,12 @@ st.divider()
 res = supabase.table("watchlist").select("ticker").execute()
 tickers = [r['ticker'] for r in res.data]
 
+# Initialisiere df als None, um NameError zu vermeiden
+df = pd.DataFrame()
+
 if tickers:
     data_list = []
-    with st.spinner("Berechne technische & fundamentale Daten..."):
+    with st.spinner("Analysiere Watchlist..."):
         for t in tickers:
             d = get_extended_data(t)
             if d:
@@ -106,8 +106,6 @@ if tickers:
                 t2 = d['FV'] * (1 - t2_pct/100)
                 diff_fv = ((d['Preis'] / d['FV']) - 1) * 100
                 
-                # Erweiterte Empfehlungs-Logik
-                # Kaufen, wenn: Preis deutlich unter FV ODER (RSI niedrig UND Korrektur > Durchschnitt)
                 if diff_fv < -10 or (d['RSI'] < 35 and d['Korr_Akt'] < d['Korr_Avg']):
                     rec, priority = "KAUFEN 🟢", 1
                 elif diff_fv < 5:
@@ -126,21 +124,22 @@ if tickers:
     if data_list:
         df = pd.DataFrame(data_list).sort_values(by=["Priority", "Abst. FV %"], ascending=[True, True])
         
-        # Tabelle anzeigen (Priority ausblenden)
+        # DataFrame Anzeige ohne das veraltete '=True'
         st.dataframe(
             df.drop(columns=["Priority"]).style.apply(
                 lambda x: ['background-color: #042f04' if "🟢" in str(x.Empfehlung) else '' for i in x], axis=1
-            ), use_container_width=True, hide_index=True
+            ), use_container_width=True
         )
 
-   # --- 5. OPTIMIERTER PERPLEXITY PRO LINK ---
-st.divider()
-st.subheader("🔍 Experten-Analyse (Professional Prompt)")
-sel = st.selectbox("Aktie für Deep-Dive wählen:", df['Ticker'].tolist())
-r = df[df['Ticker'] == sel].iloc[0]
+        # --- 5. PERPLEXITY LINK ---
+        st.divider()
+        st.subheader("🔍 Experten-Analyse (Professional Prompt)")
+        
+        # Selectbox greift jetzt nur zu, wenn df nicht leer ist
+        sel = st.selectbox("Aktie für Deep-Dive wählen:", df['Ticker'].tolist())
+        r = df[df['Ticker'] == sel].iloc[0]
 
-# Der perfekt konfigurierte Prompt für die URL
-perp_prompt = f"""Du bist renommierter Analyst. Analysiere {sel} ({r['Ticker']}): 
+        perp_prompt = f"""Du bist renommierter Analyst. Analysiere {sel} ({r['Ticker']}): 
 Kurs {r['Preis']}, Fair Value {r['Fair Value']}, RSI {r['RSI']}, Korrektur {r['Korr. ATH %']}% (Schnitt {r['Ø Korr %']}%).
 1. Kurz-Statement zu News & Marktstellung.
 2. Fair Value Check (Aktienfinder-Style) & KGV/Cashflow-Bewertung.
@@ -148,6 +147,9 @@ Kurs {r['Preis']}, Fair Value {r['Fair Value']}, RSI {r['RSI']}, Korrektur {r['K
 4. Kaufzonen-Urteil: Warum JETZT investieren?
 5. Ausblick & Renditeerwartung für 2026."""
 
-url = f"https://www.perplexity.ai/?q={quote(perp_prompt)}"
-
-st.link_button(f"🚀 {sel} Experten-Analyse starten", url, use_container_width=True)
+        url = f"https://www.perplexity.ai/?q={quote(perp_prompt)}"
+        st.link_button(f"🚀 {sel} Experten-Analyse starten", url, use_container_width=True)
+    else:
+        st.info("Lade Daten oder keine Ticker gefunden...")
+else:
+    st.warning("Die Watchlist in Supabase ist leer.")
