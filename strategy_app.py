@@ -5,7 +5,7 @@ import pandas as pd
 from urllib.parse import quote
 
 # --- 1. SETUP & SIDEBAR ---
-st.set_page_config(page_title="FairValue Watchlist v2 - Sorted", layout="wide")
+st.set_page_config(page_title="FairValue Watchlist v3 - Deep Analysis", layout="wide")
 
 with st.sidebar:
     st.header("⚙️ Strategie-Einstellungen")
@@ -33,9 +33,8 @@ def calculate_smart_fv(ticker):
         fcf = info.get('freeCashflow', 0)
         shares = info.get('sharesOutstanding', 1)
         
-        # Graham Formel
+        # Graham Formel & Cashflow Multiplikator
         fv_graham = eps * (8.5 + 2 * (growth * 100)) if eps > 0 else 0
-        # Cashflow Multiplikator
         fv_fcf = (fcf / shares) * 20 if fcf and shares else 0
         
         if fv_graham > 0 and fv_fcf > 0:
@@ -48,18 +47,32 @@ def calculate_smart_fv(ticker):
         return 0
 
 @st.cache_data(ttl=3600)
-def get_stock_data(ticker):
+def get_extended_data(ticker):
     try:
         s = yf.Ticker(ticker)
+        h = s.history(period="3y") # 3 Jahre für Durchschnittskorrektur
+        if h.empty: return None
+        
         info = s.info
-        h = s.history(period="1mo")
+        cp = h['Close'].iloc[-1]
+        ath = h['High'].max()
+        
+        # Korrektur-Statistik
+        curr_corr = ((cp / ath) - 1) * 100
+        roll_max = h['High'].cummax()
+        avg_corr = ((h['Low'] - roll_max) / roll_max).mean() * 100
+
+        # RSI
         delta = h['Close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rsi = 100 - (100 / (1 + (gain / loss))).iloc[-1]
         
         return {
-            "Preis": info.get('currentPrice'),
+            "Preis": round(cp, 2),
+            "ATH": round(ath, 2),
+            "Korr_Akt": round(curr_corr, 1),
+            "Korr_Avg": round(avg_corr, 1),
             "RSI": round(rsi, 1),
             "FV": calculate_smart_fv(ticker)
         }
@@ -73,69 +86,56 @@ try:
     fg = min(100, int((spy['Close'].iloc[-1] / sma125) * 50))
 except: vix, fg = 20, 50
 
-st.title("🎯 Strategie-Zentrale: Sortiert nach Kauf-Chance")
+st.title("🏛️ Deep-Value Strategie Cockpit")
 c1, c2 = st.columns(2)
 c1.metric("VIX Index", f"{vix:.2f}")
 c2.metric("Fear & Greed", f"{fg}/100")
 st.divider()
 
-# --- 4. WATCHLIST & SORTIERTE TABELLE ---
+# --- 4. ANALYSE & SORTIERUNG ---
 res = supabase.table("watchlist").select("ticker").execute()
 tickers = [r['ticker'] for r in res.data]
 
 if tickers:
     data_list = []
-    for t in tickers:
-        d = get_stock_data(t)
-        if d:
-            t1 = d['FV'] * (1 - t1_pct/100)
-            t2 = d['FV'] * (1 - t2_pct/100)
-            diff_pct = ((d['Preis'] / d['FV']) - 1) * 100
-            
-            # Bewertung & Sortier-Priorität
-            if diff_pct < -15:
-                rec = "KAUFEN 🟢"
-                priority = 1
-            elif diff_pct < 5:
-                rec = "BEOBACHTEN 🟡"
-                priority = 2
-            else:
-                rec = "WARTEN / ÜBERTEUERT 🔴"
-                priority = 3
-            
-            data_list.append({
-                "Priority": priority,
-                "Ticker": t, 
-                "Preis": d['Preis'], 
-                "RSI": d['RSI'],
-                "Fair Value": d['FV'], 
-                "Abstand FV %": round(diff_pct, 1),
-                f"T1 (-{t1_pct}%)": round(t1, 2),
-                f"T2 (-{t2_pct}%)": round(t2, 2), 
-                "Empfehlung": rec
-            })
+    with st.spinner("Berechne technische & fundamentale Daten..."):
+        for t in tickers:
+            d = get_extended_data(t)
+            if d:
+                t1 = d['FV'] * (1 - t1_pct/100)
+                t2 = d['FV'] * (1 - t2_pct/100)
+                diff_fv = ((d['Preis'] / d['FV']) - 1) * 100
+                
+                # Erweiterte Empfehlungs-Logik
+                # Kaufen, wenn: Preis deutlich unter FV ODER (RSI niedrig UND Korrektur > Durchschnitt)
+                if diff_fv < -10 or (d['RSI'] < 35 and d['Korr_Akt'] < d['Korr_Avg']):
+                    rec, priority = "KAUFEN 🟢", 1
+                elif diff_fv < 5:
+                    rec, priority = "BEOBACHTEN 🟡", 2
+                else:
+                    rec, priority = "WARTEN 🔴", 3
+                
+                data_list.append({
+                    "Priority": priority, "Ticker": t, "Preis": d['Preis'], 
+                    "Abst. FV %": round(diff_fv, 1), "Korr. ATH %": d['Korr_Akt'], 
+                    "Ø Korr %": d['Korr_Avg'], "RSI": d['RSI'], "Fair Value": d['FV'],
+                    f"T1 (-{t1_pct}%)": round(t1, 2), f"T2 (-{t2_pct}%)": round(t2, 2), 
+                    "Empfehlung": rec
+                })
 
     if data_list:
-        df = pd.DataFrame(data_list)
+        df = pd.DataFrame(data_list).sort_values(by=["Priority", "Abst. FV %"], ascending=[True, True])
         
-        # --- SORTIERUNG ---
-        # 1. Nach Priority (Kaufen zuerst), 2. Nach Abstand FV % (Günstigste zuerst)
-        df = df.sort_values(by=["Priority", "Abstand FV %"], ascending=[True, True])
-        
-        # Priority Spalte für die Anzeige entfernen
-        display_df = df.drop(columns=["Priority"])
-
+        # Tabelle anzeigen (Priority ausblenden)
         st.dataframe(
-            display_df.style.apply(lambda x: ['background-color: #004d00' if "🟢" in str(x.Empfehlung) else '' for i in x], axis=1),
-            use_container_width=True, 
-            hide_index=True
+            df.drop(columns=["Priority"]).style.apply(
+                lambda x: ['background-color: #042f04' if "🟢" in str(x.Empfehlung) else '' for i in x], axis=1
+            ), use_container_width=True, hide_index=True
         )
 
-    # --- 5. PERPLEXITY BUTTON ---
+    # --- 5. PERPLEXITY LINK ---
     st.divider()
     sel = st.selectbox("Deep-Dive Analyse wählen:", df['Ticker'].tolist())
-    row = df[df['Ticker'] == sel].iloc[0]
-    
-    prompt = f"Analysiere {sel}. Kurs {row['Preis']}, RSI {row['RSI']}. Fair Value {row['Fair Value']}. News & Prognose?"
-    url = f"https://www.perplexity.ai/?q={quote(prompt)}"
-    st.link_button(f"🚀 {sel} Deep-Dive auf Perplexity", url, use_container_width=True)
+    r = df[df['Ticker'] == sel].iloc[0]
+    perp_prompt = f"Analysiere {sel}. Kurs {r['Preis']}, Fair Value {r['Fair Value']}, RSI {r['RSI']}. Aktuelle Korrektur {r['Korr. ATH %']}% vs Ø {r['Ø Korr %']}%. Einschätzung?"
+    st.link_button(f"🚀 {sel} auf Perplexity prüfen", f"https://www.perplexity.ai/?q={quote(perp_prompt)}", use_container_width=True)
