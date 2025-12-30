@@ -4,71 +4,57 @@ import yfinance as yf
 import pandas as pd
 from urllib.parse import quote
 
-# --- 1. SETUP & SIDEBAR ---
-st.set_page_config(page_title="FairValue Watchlist v4.2 - Strict Mode", layout="wide")
-
-with st.sidebar:
-    st.header("⚙️ Strategie-Einstellungen")
-    t1_pct = st.slider("Tranche 1 Abstand (%)", 1, 30, 10)
-    t2_pct = st.slider("Tranche 2 Abstand (%)", 1, 30, 15)
-    st.divider()
-    st.info("💡 Strict Mode: 15% Sicherheitsmarge & KGV-Deckel (max. 20) sind aktiv.")
-    if st.button("🔄 Daten neu laden"):
-        st.cache_data.clear()
-        st.rerun()
+# --- 1. SETUP ---
+st.set_page_config(page_title="Buffett-Kommer Strategie v4.3", layout="wide")
 
 try:
     supabase = create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
 except Exception as e:
-    st.error(f"Supabase Fehler: {e}")
+    st.error(f"Datenbank-Fehler: {e}")
     st.stop()
 
-# --- 2. VERSCHÄRFTE FAIR VALUE LOGIK ---
-def calculate_strict_fv(ticker):
+# --- 2. BUFFETT/KOMMER FAIR VALUE LOGIK ---
+def calculate_value_investing_fv(ticker):
+    """Berechnet den fairen Wert basierend auf Gewinnrendite und Cashflow (Buffett-Stil)."""
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
-        cp = info.get('currentPrice', 0)
-        eps = info.get('forwardEps', 0)
         
-        # Wachstum vorsichtig schätzen (halbiert)
-        growth = info.get('earningsGrowth', 0.05) * 0.5 
+        # Owner Earnings Approximation (Free Cash Flow + Net Income) / 2
         fcf = info.get('freeCashflow', 0)
+        net_income = info.get('netIncomeToCommon', 0)
         shares = info.get('sharesOutstanding', 1)
         
-        # A: Graham Formel mit KGV-Deckel bei 20
-        # FV = EPS * (Basis 8.5 + 2 * g)
-        pe_multiplier = min(20, (8.5 + 2 * (growth * 100)))
-        fv_graham = eps * pe_multiplier if eps > 0 else 0
+        if shares <= 0: return 0
         
-        # B: Cashflow Basis mit Multiplikator-Deckel bei 15
-        fv_fcf = (fcf / shares) * 15 if fcf and shares else 0
+        owner_earnings_per_share = ((fcf + net_income) / 2) / shares
         
-        # Kombinierter Wert
-        if fv_graham > 0 and fv_fcf > 0:
-            raw_fv = (fv_graham * 0.5) + (fv_fcf * 0.5)
+        # Buffett verlangt oft eine Gewinnrendite (Earnings Yield) von mind. 6-8%
+        # Wir diskontieren die Owner Earnings mit einem Faktor von 12.5 bis 15 (entspricht 6.5% - 8% Rendite)
+        fv_buffett = owner_earnings_per_share * 15 
+        
+        # Sicherheits-Check: Darf nicht extrem vom Buchwert abweichen (Kommer Fokus auf Substanz)
+        book_value = info.get('bookValue', 0)
+        if book_value > 0:
+            # Gewichtung: 70% Ertragskraft (Buffett), 30% Substanz (Kommer)
+            final_fv = (fv_buffett * 0.7) + (book_value * 1.5 * 0.3)
         else:
-            raw_fv = max(fv_graham, fv_fcf)
+            final_fv = fv_buffett
             
-        # Sicherheitsmarge (Margin of Safety) von 15% abziehen
-        strict_fv = raw_fv * 0.85
-            
-        return round(strict_fv, 2) if strict_fv > 0 else round(cp * 0.7, 2)
+        return round(final_fv, 2)
     except:
         return 0
 
 @st.cache_data(ttl=3600)
-def get_extended_data(ticker):
+def get_analysis_data(ticker):
     try:
         s = yf.Ticker(ticker)
-        h = s.history(period="3y")
+        h = s.history(period="2y")
         if h.empty: return None
         
         cp = h['Close'].iloc[-1]
         ath = h['High'].max()
-        curr_corr = ((cp / ath) - 1) * 100
-        roll_max = h['High'].cummax()
-        avg_corr = ((h['Low'] - roll_max) / roll_max).mean() * 100
+        corr = ((cp / ath) - 1) * 100
         
         # RSI
         delta = h['Close'].diff()
@@ -78,70 +64,67 @@ def get_extended_data(ticker):
         
         return {
             "Preis": round(cp, 2),
-            "Korr_Akt": round(curr_corr, 1),
-            "Korr_Avg": round(avg_corr, 1),
+            "Korr_Akt": round(corr, 1),
             "RSI": round(rsi, 1),
-            "FV": calculate_strict_fv(ticker)
+            "FV": calculate_value_investing_fv(ticker)
         }
     except: return None
 
-# --- 3. MARKT HEADER ---
-try:
-    vix = yf.Ticker("^VIX").history(period="1d")['Close'].iloc[-1]
-    spy = yf.Ticker("^GSPC").history(period="300d")
-    sma125 = spy['Close'].rolling(125).mean().iloc[-1]
-    fg = min(100, int((spy['Close'].iloc[-1] / sma125) * 50))
-except: vix, fg = 20, 50
+# --- 3. DASHBOARD ---
+st.title("🛡️ Buffett-Kommer Value Cockpit")
+st.markdown("**Kriterien:** RSI < 38 | Preis ±10% vom FV | Korrektur > 10%")
 
-st.title("🏛️ Deep-Value Cockpit (Strict Mode)")
-c1, c2 = st.columns(2)
-c1.metric("VIX Index", f"{vix:.2f}")
-c2.metric("Fear & Greed", f"{fg}/100")
-st.divider()
-
-# --- 4. ANALYSE & SORTIERUNG ---
 res = supabase.table("watchlist").select("ticker").execute()
 tickers = [r['ticker'] for r in res.data]
 
-df = pd.DataFrame()
-
 if tickers:
     data_list = []
-    with st.spinner("Strenge Bewertung läuft..."):
+    with st.spinner("Prüfe Value-Kriterien..."):
         for t in tickers:
-            d = get_extended_data(t)
-            if d:
-                t1 = d['FV'] * (1 - t1_pct/100)
-                t2 = d['FV'] * (1 - t2_pct/100)
-                diff_fv = ((d['Preis'] / d['FV']) - 1) * 100
+            d = get_analysis_data(t)
+            if d and d['FV'] > 0:
+                # Berechne Abweichung vom Fair Value
+                fv_diff = ((d['Preis'] / d['FV']) - 1) * 100
                 
-                # Strenge Empfehlung: Kaufen erst ab 20% Discount zum strengen FV
-                if diff_fv < -10:
-                    rec, priority = "KAUFEN 🟢", 1
-                elif diff_fv < 0:
+                # DIE NEUEN STRENGEN FILTER
+                is_rsi_ok = d['RSI'] < 38
+                is_fv_ok = -10 <= fv_diff <= 10
+                is_corr_ok = d['Korr_Akt'] <= -10
+                
+                if is_rsi_ok and is_fv_ok and is_corr_ok:
+                    rec, priority = "KAUF-ZONE 💎", 1
+                elif is_fv_ok or (is_rsi_ok and is_corr_ok):
                     rec, priority = "BEOBACHTEN 🟡", 2
                 else:
-                    rec, priority = "ÜBERTEUERT 🔴", 3
+                    rec, priority = "WARTEN ⚪", 3
                 
                 data_list.append({
-                    "Priority": priority, "Ticker": t, "Preis": d['Preis'], 
-                    "Abst. FV %": round(diff_fv, 1), "Korr. ATH %": d['Korr_Akt'], 
-                    "Ø Korr %": d['Korr_Avg'], "RSI": d['RSI'], "Strict FV": d['FV'],
-                    "T1": round(t1, 2), "T2": round(t2, 2), 
-                    "Empfehlung": rec
+                    "Priority": priority,
+                    "Ticker": t,
+                    "Preis": d['Preis'],
+                    "RSI": d['RSI'],
+                    "Fair Value": d['FV'],
+                    "Abst. FV %": round(fv_diff, 1),
+                    "Korr. %": d['Korr_Akt'],
+                    "Status": rec
                 })
 
     if data_list:
-        df = pd.DataFrame(data_list).sort_values(by=["Priority", "Abst. FV %"], ascending=[True, True])
+        df = pd.DataFrame(data_list).sort_values(by=["Priority", "Abst. FV %"])
         st.dataframe(
             df.drop(columns=["Priority"]).style.apply(
-                lambda x: ['background-color: #042f04' if "🟢" in str(x.Empfehlung) else '' for i in x], axis=1
-            ), use_container_width=True
+                lambda x: ['background-color: #042f04' if "💎" in str(x.Status) else '' for i in x], axis=1
+            ), use_container_width=True, hide_index=True
         )
 
-        # --- 5. PERPLEXITY LINK ---
+        # --- PERPLEXITY ---
         st.divider()
         sel = st.selectbox("Deep-Dive Analyse:", df['Ticker'].tolist())
         r = df[df['Ticker'] == sel].iloc[0]
-        prompt = f"Analysten-Analyse für {sel}: Kurs {r['Preis']}, STRENGER Fair Value {r['Strict FV']}, RSI {r['RSI']}. Warum ist die Aktie trotz strenger Kriterien kaufenswert?"
-        st.link_button(f"🚀 {sel} Experten-Analyse", f"https://www.perplexity.ai/?q={quote(prompt)}", use_container_width=True)
+        prompt = f"""Analysiere {sel} nach Buffett/Kommer:
+1. Ist das Geschäftsmodell "burggrabenfähig" (Moat)?
+2. Bewertung: Kurs {r['Preis']} bei FV {r['Fair Value']}.
+3. Antizyklik: RSI {r['RSI']} und Korrektur {r['Korr. %']}%.
+4. Warum ist JETZT der richtige Zeitpunkt für einen Value-Einstieg?"""
+        
+        st.link_button(f"🚀 {sel} Value-Analyse", f"https://www.perplexity.ai/?q={quote(prompt)}", use_container_width=True)
