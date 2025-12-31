@@ -12,12 +12,10 @@ st.set_page_config(page_title="Stock Strategy Analysis", layout="wide")
 @st.cache_resource
 def init_supabase():
     try:
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
-        return create_client(url, key)
-    except Exception as e:
-        st.error(f"Verbindungsfehler zu Supabase: {e}")
-        return None
+    supabase = create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
+except Exception as e:
+    st.error(f"Datenbank-Fehler: {e}")
+    st.stop()
 
 supabase = init_supabase()
 
