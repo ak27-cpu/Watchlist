@@ -64,33 +64,30 @@ def get_eur_usd():
         pass
     return FALLBACK_EUR_USD
 
-def calculate_fcf_per_share(info: dict) -> float:
-    try:
-        fcf = info.get('freeCashflow') or 0
-        shares = info.get('sharesOutstanding') or 1
-        if fcf > 0 and shares > 0:
-            return fcf / shares
-    except Exception:
-        pass
-    return 0.0
-
-def calculate_dcf_fair_value(fcf_per_share: float, growth_rate: float = 0.10) -> dict:
-    if fcf_per_share <= 0:
+def calculate_dcf_fair_value_eps(eps: float, growth_rate: float = 0.10) -> dict:
+    """
+    DCF-Bewertung basierend auf EPS (wie Aktienfinder)
+    Statt FCF - damit näher am realen Modell
+    """
+    
+    if eps <= 0:
         return {"fv": 0, "pv_10y": 0, "pv_terminal": 0, "error": True}
     
     try:
         if WACC <= growth_rate:
-            fv = fcf_per_share * 15
+            fv = eps * 35
             return {"fv": fv, "pv_10y": fv * 0.7, "pv_terminal": fv * 0.3, "method": "Fallback"}
         
         pv_10y = 0
+        
         for year in range(1, 11):
-            fcf_projected = fcf_per_share * ((1 + growth_rate) ** year)
-            pv = fcf_projected / ((1 + WACC) ** year)
+            eps_projected = eps * ((1 + growth_rate) ** year)
+            pv = eps_projected / ((1 + WACC) ** year)
             pv_10y += pv
         
-        fcf_year10 = fcf_per_share * ((1 + growth_rate) ** 10)
-        terminal_value = (fcf_year10 * (1 + TERMINAL_GROWTH)) / (WACC - TERMINAL_GROWTH)
+        eps_year10 = eps * ((1 + growth_rate) ** 10)
+        terminal_multiple = (1 + TERMINAL_GROWTH) / (WACC - TERMINAL_GROWTH)
+        terminal_value = eps_year10 * terminal_multiple
         pv_terminal = terminal_value / ((1 + WACC) ** 10)
         
         fv = pv_10y + pv_terminal
@@ -99,9 +96,12 @@ def calculate_dcf_fair_value(fcf_per_share: float, growth_rate: float = 0.10) ->
             "fv": fv,
             "pv_10y": pv_10y,
             "pv_terminal": pv_terminal,
-            "fcf_year10": fcf_year10,
-            "error": False
+            "eps_year10": eps_year10,
+            "terminal_multiple": terminal_multiple,
+            "error": False,
+            "method": "DCF 10-Year EPS + Terminal"
         }
+    
     except Exception as e:
         return {"fv": 0, "error": True, "error_msg": str(e)}
 
@@ -150,7 +150,7 @@ def generate_signal(price_eur: float, fv_eur: float, rsi: float, mos_pct: float)
         return "🔴 WARTEN", 3
 
 db = init_db()
-st.title("💎 Equity Intelligence: DCF Fair Value (Buffett-Style)")
+st.title("💎 Equity Intelligence: DCF Fair Value (Buffett-Style, EPS-basiert)")
 
 with st.sidebar:
     st.header("⚙️ DCF Parameter")
@@ -170,6 +170,7 @@ with st.sidebar:
     
     st.metric("WACC (Discount Rate)", f"{WACC*100:.2f}%")
     st.metric("Terminal Growth", f"{TERMINAL_GROWTH*100:.1f}%")
+    st.metric("Bewertung", "EPS-basiert (wie Aktienfinder)")
     
     st.divider()
     mos_pct = st.slider("Margin of Safety", min_value=1, max_value=30, value=15, step=1) / 100
@@ -225,8 +226,8 @@ try:
 
         hist, info = market_data_map[t]
         
-        fcf_per_share = calculate_fcf_per_share(info)
-        dcf_result = calculate_dcf_fair_value(fcf_per_share, growth_rate=growth_rate)
+        eps = info.get('trailingEps') or info.get('forwardEps') or 1.0
+        dcf_result = calculate_dcf_fair_value_eps(eps, growth_rate=growth_rate)
         
         price_usd = info.get('currentPrice') or hist['Close'].iloc[-1]
         fv_usd = dcf_result.get('fv', 0)
@@ -251,9 +252,11 @@ try:
             "Signal": signal,
             "_price_usd": price_usd,
             "_fv_usd": fv_usd,
-            "_fcf_per_share": fcf_per_share,
+            "_eps": eps,
             "_pv_10y": dcf_result.get('pv_10y', 0),
             "_pv_terminal": dcf_result.get('pv_terminal', 0),
+            "_eps_year10": dcf_result.get('eps_year10', 0),
+            "_terminal_multiple": dcf_result.get('terminal_multiple', 0),
             "_corr_ath": tech_metrics['corr_ath'],
             "_avg_dd": tech_metrics['avg_dd'],
             "_trend": tech_metrics['trend'],
@@ -295,29 +298,33 @@ try:
             st.subheader(f"DCF Fair Value Analyse: {selected}")
             
             col1, col2, col3, col4 = st.columns(4)
-            col1.metric("FCF/Share", f"${row['_fcf_per_share']:.2f}")
+            col1.metric("EPS (TTM)", f"${row['_eps']:.2f}")
             col2.metric("PV (10 Jahre)", f"${row['_pv_10y']:.2f}")
             col3.metric("PV Terminal", f"${row['_pv_terminal']:.2f}")
             col4.metric("Fair Value", f"${row['_fv_usd']:.2f}")
             
-            fcf_val = row['_fcf_per_share']
+            eps_val = row['_eps']
             fv_usd_val = row['_fv_usd']
             fv_eur_val = row['Fair_Value_EUR']
             kurs_eur_val = row['Kurs_EUR']
             upside_val = row['Upside_PCT']
+            eps_y10 = row['_eps_year10']
+            term_mult = row['_terminal_multiple']
             
             st.markdown(f"""
-            **DCF-Berechnung (Buffett-Style):**
+            **DCF-Berechnung (EPS-basiert, Buffett-Style):**
             
             **Annahmen:**
-            - Free Cash Flow pro Share: **${fcf_val:.2f}**
+            - EPS (Trailing Twelve Months): **${eps_val:.2f}**
             - Wachstum 10 Jahre: **{growth_rate*100:.0f}%**
             - WACC (Discount Rate): **{WACC*100:.2f}%**
             - Terminal Growth: **{TERMINAL_GROWTH*100:.1f}%**
             
             **Bewertung:**
-            - PV (Cash Flows Jahre 1-10): **${row['_pv_10y']:.2f}**
+            - PV (EPS Flows Jahre 1-10): **${row['_pv_10y']:.2f}**
             - PV (Terminal Value): **${row['_pv_terminal']:.2f}**
+            - EPS Jahr 10: **${eps_y10:.2f}**
+            - Terminal Multiple: **{term_mult:.1f}x**
             
             **Fair Value Gesamt: ${fv_usd_val:.2f} ≈ €{fv_eur_val:.2f}**
             
@@ -393,7 +400,7 @@ try:
                 height=600,
                 template="plotly_dark",
                 hovermode="x unified",
-                title=f"DCF Chartanalyse: {selected} (Growth {growth_rate*100:.0f}%)",
+                title=f"DCF Chartanalyse: {selected} (Growth {growth_rate*100:.0f}%, EPS-basiert)",
                 xaxis_rangeslider_visible=False
             )
             fig.update_yaxes(title_text="Preis (EUR)", row=1, col=1)
@@ -401,7 +408,7 @@ try:
             
             st.plotly_chart(fig, use_container_width=True)
     else:
-        st.warning("Keine gültigen Daten. Stelle sicher, dass Aktien FCF haben.")
+        st.warning("Keine gültigen Daten. Stelle sicher, dass Aktien EPS haben.")
 
 except Exception as e:
     st.error(f"Fehler: {e}")
