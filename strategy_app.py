@@ -5,9 +5,8 @@ import pandas_ta as ta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from supabase import create_client, Client
-from functools import lru_cache
-import requests
-from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 # --- 1. SETUP & STYLE ---
 st.set_page_config(page_title="Equity Intelligence Pro", layout="wide")
@@ -21,7 +20,8 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # --- 2. KONSTANTEN ---
-CACHE_TTL = 3600  # 1 Stunde
+CACHE_TTL = 3600
+WATCHLIST_CACHE_TTL = 600
 RSI_LENGTH = 14
 EMA_LENGTH = 200
 VOLUME_THRESHOLD_UP = 1.5
@@ -30,16 +30,15 @@ DRAWDOWN_THRESHOLD = -0.10
 FALLBACK_EUR_USD = 1.05
 FALLBACK_KGV = 20.0
 FALLBACK_EPS = 1.0
+MAX_WORKERS = 8
 
-# --- 3. HILFSFUNKTIONEN (OPTIMIERT) ---
+# --- 3. HILFSFUNKTIONEN ---
 @st.cache_resource
 def init_db():
-    """Initialisiere Datenbank einmalig"""
     return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_market_data(ticker: str) -> tuple | None:
-    """Lade Marktdaten mit Fehlerbehandlung"""
     try:
         tk = yf.Ticker(ticker)
         hist = tk.history(period="max")
@@ -50,32 +49,55 @@ def get_market_data(ticker: str) -> tuple | None:
         st.warning(f"Fehler beim Laden von {ticker}: {e}")
         return None
 
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def get_exchange_rate(pair: str = "EURUSD=X") -> float:
-    """Lade Wechselkurs mit Fallback"""
+@st.cache_data(ttl=WATCHLIST_CACHE_TTL, show_spinner=False)
+def get_watchlist():
+    db = init_db()
     try:
-        data = yf.download(pair, period="1d", progress=False)
-        if not data.empty:
-            return float(data['Close'].iloc[-1])
+        res = db.table("watchlist").select("ticker").execute()
+        tickers = sorted(list(set(t['ticker'].upper() for t in res.data)))
+        return tickers
+    except Exception as e:
+        st.error(f"Fehler beim Laden der Watchlist: {e}")
+        return []
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def get_eur_usd():
+    try:
+        eur_usd_data = yf.download("EURUSD=X", period="1d", progress=False)
+        if not eur_usd_data.empty:
+            return float(eur_usd_data['Close'].iloc[-1])
     except Exception as e:
         st.warning(f"Fehler beim EUR/USD-Kurs: {e}")
     return FALLBACK_EUR_USD
 
+def load_all_market_data(tickers):
+    results = {}
+    workers = min(MAX_WORKERS, len(tickers))
+    
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_ticker = {
+            executor.submit(get_market_data, t): t for t in tickers
+        }
+        for future in future_to_ticker:
+            t = future_to_ticker[future]
+            try:
+                data = future.result(timeout=30)
+                if data:
+                    results[t] = data
+            except Exception:
+                continue
+    return results
+
 def calculate_avg_drawdown(hist: pd.DataFrame) -> float:
-    """Berechne durchschnittlichen Drawdown > 10%"""
     running_max = hist['Close'].cummax()
     drawdown = (hist['Close'] - running_max) / running_max
     significant_drawdowns = drawdown[drawdown < DRAWDOWN_THRESHOLD]
     return significant_drawdowns.mean() * 100 if not significant_drawdowns.empty else 0.0
 
 def calculate_technical_metrics(hist: pd.DataFrame, price_usd: float) -> dict:
-    """Berechne alle technischen Metriken in einer Funktion"""
     metrics = {}
-    
-    # RSI
     metrics['rsi'] = ta.rsi(hist['Close'], length=RSI_LENGTH).iloc[-1]
     
-    # EMA 200 & Trend
     if len(hist) > EMA_LENGTH:
         ema200 = ta.ema(hist['Close'], length=EMA_LENGTH).iloc[-1]
         metrics['trend'] = "Bullish" if price_usd > ema200 else "Bearish"
@@ -84,7 +106,6 @@ def calculate_technical_metrics(hist: pd.DataFrame, price_usd: float) -> dict:
         metrics['trend'] = "N/A"
         metrics['ema200'] = None
     
-    # Volume
     vol_now = hist['Volume'].iloc[-1]
     vol_ma = hist['Volume'].tail(20).mean()
     if vol_now > (vol_ma * VOLUME_THRESHOLD_UP):
@@ -94,7 +115,6 @@ def calculate_technical_metrics(hist: pd.DataFrame, price_usd: float) -> dict:
     else:
         metrics['volume'] = "Normal"
     
-    # ATH & Drawdown
     metrics['ath'] = hist['High'].max()
     metrics['corr_ath'] = ((price_usd - metrics['ath']) / metrics['ath']) * 100
     metrics['avg_dd'] = calculate_avg_drawdown(hist)
@@ -102,7 +122,6 @@ def calculate_technical_metrics(hist: pd.DataFrame, price_usd: float) -> dict:
     return metrics
 
 def generate_signal(price_eur: float, fv_eur: float, rsi: float, mos_pct: float) -> tuple[str, int]:
-    """Generiere Kauf-Signal und Ranking"""
     buy_limit = fv_eur * (1 - mos_pct)
     watch_limit = fv_eur * (1 + mos_pct)
     
@@ -114,7 +133,6 @@ def generate_signal(price_eur: float, fv_eur: float, rsi: float, mos_pct: float)
         return "🔴 WARTEN", 3
 
 def calculate_fair_value(eps: float, kgv_normal: float) -> float:
-    """Berechne Fair Value als Durchschnitt konservativer & normaler KGV"""
     kgv_konservativ = kgv_normal * 0.8
     return ((eps * kgv_konservativ) + (eps * kgv_normal)) / 2
 
@@ -148,50 +166,47 @@ with st.sidebar:
             st.warning("Ticker zu lang")
 
 try:
-    # Lade Watchlist
-    res = db.table("watchlist").select("ticker").execute()
-    tickers = sorted(list(set([t['ticker'].upper() for t in res.data])))  # Duplikate entfernen
+    tickers = get_watchlist()
     
     if not tickers:
         st.info("Bitte Ticker hinzufügen.")
         st.stop()
     
-    # Lade EUR/USD
-    eur_usd = get_exchange_rate()
-
-    # --- BATCH-VERARBEITUNG (PARALLEL MÖGLICH) ---
+    eur_usd = get_eur_usd()
     all_results = []
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+
+    with st.spinner(f'Lade Marktdaten parallel für {len(tickers)} Ticker...'):
+        start_time = time.time()
+        market_data_map = load_all_market_data(tickers)
+        load_time = time.time() - start_time
+
+    if not market_data_map:
+        st.warning("Keine Marktdaten geladen. Möglicherweise blockiert Yahoo Finance die Anfragen. Bitte warte eine Minute und drücke 'Daten aktualisieren'.")
+        st.stop()
+
+    col1, col2, col3 = st.columns([2, 1, 1])
+    col1.info(f"✅ {len(market_data_map)}/{len(tickers)} Ticker geladen in {load_time:.2f}s (parallel)")
     
-    for idx, t in enumerate(tickers):
-        status_text.text(f"Verarbeite {t}... ({idx + 1}/{len(tickers)})")
-        progress_bar.progress((idx + 1) / len(tickers))
-        
-        data = get_market_data(t)
-        if not data:
+    for t in tickers:
+        if t not in market_data_map:
             continue
-        
-        hist, info = data
-        
-        # --- EXTRAHIERE INFO (mit Fallbacks) ---
+
+        hist, info = market_data_map[t]
+
         eps_2026 = info.get('forwardEps') or info.get('trailingEps') or FALLBACK_EPS
         kgv_normal = info.get('forwardPE') or FALLBACK_KGV
         price_usd = info.get('currentPrice') or hist['Close'].iloc[-1]
-        
-        # --- BERECHNUNGEN ---
+
         fv_usd = calculate_fair_value(eps_2026, kgv_normal)
         fv_eur = fv_usd / eur_usd
         price_eur = price_usd / eur_usd
         upside = ((fv_eur - price_eur) / price_eur) * 100
-        
-        # Technische Metriken
+
         tech_metrics = calculate_technical_metrics(hist, price_usd)
         rsi_now = tech_metrics['rsi']
-        
-        # Signal
+
         signal, rank = generate_signal(price_eur, fv_eur, rsi_now, mos_pct)
-        
+
         all_results.append({
             "Ticker": t,
             "Kurs (€)": price_eur,
@@ -208,11 +223,7 @@ try:
             "_rank": rank,
             "_ema200": tech_metrics['ema200']
         })
-    
-    progress_bar.empty()
-    status_text.empty()
-    
-    # --- TABELLE & RANKING ---
+
     if all_results:
         df = pd.DataFrame(all_results).sort_values(["_rank", "Upside (%)"], ascending=[True, False])
 
@@ -236,96 +247,86 @@ try:
 
         st.divider()
 
-        # --- TIEFENANALYSE ---
         st.subheader("🔬 Tiefenanalyse")
         selected = st.selectbox("Ticker auswählen", df['Ticker'].values)
         
         if selected:
             row = df[df['Ticker'] == selected].iloc[0]
-            hist_data = get_market_data(selected)
+            hist, _ = market_data_map[selected]
+
+            col1, col2, col3, col4, col5 = st.columns(5)
+            col1.metric("Kurs", f"{row['_price_usd']:.2f} $", delta=f"≈ {row['Kurs (€)']:.2f} €", delta_color="off")
+            col2.metric("Fair Value Ø", f"{row['_fv_usd']:.2f} $", delta=f"≈ {row['Fair Value (€)']:.2f} €", delta_color="off")
             
-            if hist_data:
-                hist, _ = hist_data
-                
-                # Metriken
-                col1, col2, col3, col4, col5 = st.columns(5)
-                col1.metric("Kurs", f"{row['_price_usd']:.2f} $", delta=f"≈ {row['Kurs (€)']:.2f} €", delta_color="off")
-                col2.metric("Fair Value Ø", f"{row['_fv_usd']:.2f} $", delta=f"≈ {row['Fair Value (€)']:.2f} €", delta_color="off")
-                
-                rsi_status = "Überverkauft (<30)" if row['RSI'] < 30 else ("Kaufzone (<40)" if row['RSI'] < 40 else "Neutral")
-                col3.metric("RSI (14)", f"{row['RSI']:.1f}", delta=rsi_status, delta_color="inverse")
-                col4.metric("Korrektur (ATH)", f"{row['_corr_ath']:.1f}%", delta=f"Ø: {row['_avg_dd']:.1f}%", delta_color="off")
-                col5.metric("Trend / Vol", f"{row['_trend']}", delta=f"{row['_vol']}")
+            rsi_status = "Überverkauft (<30)" if row['RSI'] < 30 else ("Kaufzone (<40)" if row['RSI'] < 40 else "Neutral")
+            col3.metric("RSI (14)", f"{row['RSI']:.1f}", delta=rsi_status, delta_color="inverse")
+            col4.metric("Korrektur (ATH)", f"{row['_corr_ath']:.1f}%", delta=f"Ø: {row['_avg_dd']:.1f}%", delta_color="off")
+            col5.metric("Trend / Vol", f"{row['_trend']}", delta=f"{row['_vol']}")
 
-                # --- OPTIMIERTER CHART ---
-                fig = make_subplots(
-                    rows=2, cols=1,
-                    shared_xaxes=True,
-                    vertical_spacing=0.08,
-                    row_heights=[0.7, 0.3],
-                    subplot_titles=(f"{selected} - Preis & Fair Value", "RSI (14)")
-                )
-                
-                hist_eur = hist['Close'] / eur_usd
-                fv_eur = row['Fair Value (€)']
-                
-                # Kurs
+            fig = make_subplots(
+                rows=2, cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.08,
+                row_heights=[0.7, 0.3],
+                subplot_titles=(f"{selected} - Preis & Fair Value", "RSI (14)")
+            )
+            
+            hist_eur = hist['Close'] / eur_usd
+            fv_eur = row['Fair Value (€)']
+            
+            fig.add_trace(
+                go.Scatter(x=hist.index, y=hist_eur, name="Kurs (€)", 
+                          line=dict(color='#58a6ff', width=2)),
+                row=1, col=1
+            )
+            
+            if row['_ema200'] is not None:
+                ema = ta.ema(hist['Close'], length=EMA_LENGTH) / eur_usd
                 fig.add_trace(
-                    go.Scatter(x=hist.index, y=hist_eur, name="Kurs (€)", 
-                              line=dict(color='#58a6ff', width=2)),
+                    go.Scatter(x=hist.index, y=ema, name="EMA 200",
+                              line=dict(color='orange', width=1, dash='dash')),
                     row=1, col=1
                 )
-                
-                # EMA 200 (nur wenn vorhanden)
-                if row['_ema200'] is not None:
-                    ema = ta.ema(hist['Close'], length=EMA_LENGTH) / eur_usd
-                    fig.add_trace(
-                        go.Scatter(x=hist.index, y=ema, name="EMA 200",
-                                  line=dict(color='orange', width=1, dash='dash')),
-                        row=1, col=1
-                    )
 
-                # Fair Value Zone
-                mos_upper = fv_eur * (1 + mos_pct)
-                mos_lower = fv_eur * (1 - mos_pct)
-                
-                fig.add_trace(
-                    go.Scatter(x=[hist.index[0], hist.index[-1]], y=[mos_upper, mos_upper],
-                              mode='lines', line=dict(width=0), showlegend=False),
-                    row=1, col=1
-                )
-                fig.add_trace(
-                    go.Scatter(x=[hist.index[0], hist.index[-1]], y=[mos_lower, mos_lower],
-                              mode='lines', line=dict(width=0),
-                              fill='tonexty', fillcolor='rgba(40, 167, 69, 0.2)',
-                              name=f"Fair Value Zone (±{mos_pct*100:.0f}%)"),
-                    row=1, col=1
-                )
-                fig.add_hline(y=fv_eur, line_dash="dash", line_color="#28a745",
-                             annotation_text="Fair Value", row=1, col=1)
+            mos_upper = fv_eur * (1 + mos_pct)
+            mos_lower = fv_eur * (1 - mos_pct)
+            
+            fig.add_trace(
+                go.Scatter(x=[hist.index[0], hist.index[-1]], y=[mos_upper, mos_upper],
+                          mode='lines', line=dict(width=0), showlegend=False),
+                row=1, col=1
+            )
+            fig.add_trace(
+                go.Scatter(x=[hist.index[0], hist.index[-1]], y=[mos_lower, mos_lower],
+                          mode='lines', line=dict(width=0),
+                          fill='tonexty', fillcolor='rgba(40, 167, 69, 0.2)',
+                          name=f"Fair Value Zone (±{mos_pct*100:.0f}%)"),
+                row=1, col=1
+            )
+            fig.add_hline(y=fv_eur, line_dash="dash", line_color="#28a745",
+                         annotation_text="Fair Value", row=1, col=1)
 
-                # RSI
-                rsi = ta.rsi(hist['Close'], length=RSI_LENGTH)
-                fig.add_trace(
-                    go.Scatter(x=hist.index, y=rsi, name="RSI",
-                              line=dict(color='#ff7f0e', width=1.5)),
-                    row=2, col=1
-                )
-                fig.add_hline(y=40, line_dash="dot", line_color="cyan", annotation_text="Buy", row=2, col=1)
-                fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1)
-                fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1)
+            rsi = ta.rsi(hist['Close'], length=RSI_LENGTH)
+            fig.add_trace(
+                go.Scatter(x=hist.index, y=rsi, name="RSI",
+                          line=dict(color='#ff7f0e', width=1.5)),
+                row=2, col=1
+            )
+            fig.add_hline(y=40, line_dash="dot", line_color="cyan", annotation_text="Buy", row=2, col=1)
+            fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1)
+            fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1)
 
-                fig.update_layout(
-                    height=600,
-                    template="plotly_dark",
-                    hovermode="x unified",
-                    title=f"Chartanalyse: {selected}",
-                    xaxis_rangeslider_visible=False
-                )
-                fig.update_yaxes(title_text="Preis (€)", row=1, col=1)
-                fig.update_yaxes(title_text="RSI", row=2, col=1)
-                
-                st.plotly_chart(fig, use_container_width=True)
+            fig.update_layout(
+                height=600,
+                template="plotly_dark",
+                hovermode="x unified",
+                title=f"Chartanalyse: {selected}",
+                xaxis_rangeslider_visible=False
+            )
+            fig.update_yaxes(title_text="Preis (€)", row=1, col=1)
+            fig.update_yaxes(title_text="RSI", row=2, col=1)
+            
+            st.plotly_chart(fig, use_container_width=True)
     else:
         st.warning("Keine Daten verfügbar. Yahoo Finance blockiert möglicherweise die Anfragen. Bitte warten und erneut versuchen.")
 
