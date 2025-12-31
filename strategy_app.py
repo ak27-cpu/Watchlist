@@ -4,7 +4,6 @@ import pandas as pd
 import pandas_ta as ta
 import plotly.graph_objects as go
 from supabase import create_client, Client
-import requests
 
 # --- SUPABASE CONNECT ---
 def init_db():
@@ -15,14 +14,11 @@ def init_db():
 
 supabase = init_db()
 
-# --- ANALYSE ENGINE ---
+# --- ANALYSIS ENGINE ---
 def get_stock_metrics(ticker, eur_usd):
     try:
-        # Session nutzen um 401 Fehler zu vermeiden
-        session = requests.Session()
-        session.headers.update({'User-agent': 'Mozilla/5.0'})
-        
-        tk = yf.Ticker(ticker, session=session)
+        # KEINE manuelle Session mehr setzen, yfinance macht das jetzt selbst
+        tk = yf.Ticker(ticker)
         
         # Basisdaten laden
         hist = tk.history(period="max")
@@ -31,20 +27,15 @@ def get_stock_metrics(ticker, eur_usd):
             return None
             
         info = tk.info
-        if not info or 'currentPrice' not in info:
-            # Fallback für Kurspreis falls info streikt
-            price_usd = hist['Close'].iloc[-1]
-            fwd_eps = 1.0
-            growth = 0.1
-            kgv_median = 20
-        else:
-            price_usd = info.get('currentPrice')
-            fwd_eps = info.get('forwardEps') or info.get('trailingEps') or 1.0
-            growth = info.get('earningsGrowth') or 0.1
-            kgv_median = info.get('forwardPE') or 20
+        # Fallback-Logik für fehlende Info-Daten
+        price_usd = info.get('currentPrice') or hist['Close'].iloc[-1]
+        fwd_eps = info.get('forwardEps') or info.get('trailingEps') or 1.0
+        growth = info.get('earningsGrowth') or 0.1
+        kgv_median = info.get('forwardPE') or 20
         
-        # Fair Value Kalkulation
+        # Fair Value Kalkulation (Schritt 1-4)
         eps_2026 = fwd_eps * (1 + growth)**2
+        # Unteres KGV (-20%) und Oberes KGV (Median)
         fv_usd = (eps_2026 * (kgv_median * 0.8) + eps_2026 * kgv_median) / 2
         
         price_eur = price_usd / eur_usd
@@ -61,7 +52,7 @@ def get_stock_metrics(ticker, eur_usd):
         
         upside = ((fv_eur - price_eur) / price_eur) * 100
         
-        # Bewertung & Rank
+        # Bewertung & Rank für Sortierung
         if upside > 10 and rsi < 40 and vol_sig == "Buy":
             bewertung, rank = "🟢 KAUF", 1
         elif 0 <= upside <= 10:
@@ -73,6 +64,7 @@ def get_stock_metrics(ticker, eur_usd):
             "Ticker": ticker,
             "Bewertung": bewertung,
             "Kurs(€)": round(price_eur, 2),
+            "Fair Value($)": round(fv_usd, 2),
             "Fair Value(€)": round(fv_eur, 2),
             "Upside(%)": round(upside, 1),
             "Tranche1(-10%)": round(ath_eur * 0.9, 2),
@@ -83,7 +75,7 @@ def get_stock_metrics(ticker, eur_usd):
             "_rank": rank
         }
     except Exception as e:
-        st.write(f"Fehler bei Ticker {ticker}: {e}")
+        st.error(f"Fehler bei Ticker {ticker}: {e}")
         return None
 
 # --- UI ---
@@ -95,12 +87,10 @@ try:
     ticker_list = [t['ticker'].upper() for t in res.data]
     
     if ticker_list:
-        st.write(f"Gefundene Ticker: {', '.join(ticker_list)}")
-        
         # 2. EUR/USD Kurs holen
         with st.spinner('Hole Wechselkurs...'):
             eur_usd_data = yf.download("EURUSD=X", period="1d", progress=False)
-            eur_usd = eur_usd_data['Close'].iloc[-1]
+            eur_usd = float(eur_usd_data['Close'].iloc[-1])
 
         # 3. Aktien analysieren
         all_results = []
@@ -123,15 +113,31 @@ try:
                 ), 
                 use_container_width=True, hide_index=True
             )
+            
+            # Gauge Charts zur Visualisierung
+            st.divider()
+            cols = st.columns(3)
+            for i, (idx, row) in enumerate(df.iterrows()):
+                with cols[i % 3]:
+                    fig = go.Figure(go.Indicator(
+                        mode="gauge+number",
+                        value=row['Kurs(€)'],
+                        title={'text': f"{row['Ticker']} ({row['Bewertung']})"},
+                        gauge={
+                            'axis': {'range': [0, max(row['Fair Value(€)'], row['Kurs(€)']) * 1.5]},
+                            'threshold': {'line': {'color': "green", 'width': 4}, 'value': row['Fair Value(€)']}
+                        }
+                    ))
+                    fig.update_layout(height=230)
+                    st.plotly_chart(fig, use_container_width=True)
         else:
-            st.error("Es konnten keine Daten für die Tabelle berechnet werden. Prüfe die Ticker-Symbole!")
+            st.error("Keine Daten berechenbar. Prüfe die Ticker!")
     else:
-        st.info("Datenbank 'watchlist' ist leer. Füge Ticker hinzu.")
+        st.info("Datenbank ist leer.")
 
 except Exception as e:
-    st.error(f"Datenbankfehler: {e}")
+    st.error(f"Hauptfehler: {e}")
 
 with st.sidebar:
-    st.header("Admin")
     if st.button("🔄 Aktualisieren"):
         st.rerun()
