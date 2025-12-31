@@ -77,14 +77,14 @@ def get_fair_value_from_db(ticker: str) -> dict | None:
         return None
 
 def save_fair_value_to_db(ticker: str, fv_usd: float, fv_eur: float, source: str = "manual"):
-    """Speichere Fair Value in Datenbank - sofort, keine Cache Probleme"""
+    """Speichere Fair Value in Datenbank - sofort, beide Währungen!"""
     db = init_db()
     try:
         existing = get_fair_value_from_db(ticker)
         data = {
             "ticker": ticker,
-            "fair_value_usd": round(fv_usd, 2),
-            "fair_value_eur": round(fv_eur, 2),
+            "fair_value_usd": round(float(fv_usd), 2),
+            "fair_value_eur": round(float(fv_eur), 2),
             "source": source,
             "updated_at": datetime.now().isoformat()
         }
@@ -245,7 +245,7 @@ try:
         st.stop()
 
     col1, col2 = st.columns([3, 1])
-    col1.info(f"✅ {len(market_data_map)}/{len(tickers)} Ticker | Growth: {growth_rate*100:.0f}%")
+    col1.info(f"✅ {len(market_data_map)}/{len(tickers)} Ticker | Growth: {growth_rate*100:.0f}% | EUR/USD: {eur_usd:.4f}")
     
     for t in tickers:
         if t not in market_data_map:
@@ -336,29 +336,48 @@ try:
             st.divider()
             
             st.subheader("✏️ Fair Value Editor")
+            
+            # Währungs-Toggle
+            col_curr1, col_curr2 = st.columns([1, 2])
+            with col_curr1:
+                use_usd = st.radio("", ["USD", "EUR"], horizontal=True, key=f"curr_{selected}", label_visibility="collapsed")
+            
             col_fv1, col_fv2 = st.columns([3, 1])
             
             with col_fv1:
-                new_fv_usd = st.number_input(
-                    f"Fair Value ({selected}) USD:",
-                    value=row['_fv_usd'],
-                    step=1.0,
-                    min_value=0.1
-                )
+                if use_usd == "USD":
+                    new_fv_usd = st.number_input(
+                        f"Fair Value ({selected}):",
+                        value=round(row['_fv_usd'], 2),
+                        step=1.0,
+                        min_value=0.1,
+                        format="%.2f"
+                    )
+                    new_fv_eur = new_fv_usd / eur_usd
+                else:
+                    new_fv_eur = st.number_input(
+                        f"Fair Value ({selected}):",
+                        value=round(row['Fair_Value_EUR'], 2),
+                        step=1.0,
+                        min_value=0.1,
+                        format="%.2f"
+                    )
+                    new_fv_usd = new_fv_eur * eur_usd
             
             with col_fv2:
-                if st.button("💾 Speichern", key=f"save_fv_{selected}"):
-                    new_fv_eur = new_fv_usd / eur_usd
+                if st.button("💾 Save", key=f"save_fv_{selected}"):
+                    # Speichere BEIDE Werte gerundet
+                    fv_usd_rounded = round(float(new_fv_usd), 2)
+                    fv_eur_rounded = round(float(new_fv_eur), 2)
                     
-                    # Speichere in DB
-                    if save_fair_value_to_db(selected, new_fv_usd, new_fv_eur, source="manual"):
-                        st.success(f"✅ {selected} Fair Value aktualisiert!")
+                    if save_fair_value_to_db(selected, fv_usd_rounded, fv_eur_rounded, source="manual"):
+                        st.success(f"✅ ${fv_usd_rounded} / €{fv_eur_rounded}")
                         
                         # Aktualisiere nur diese Zeile im DF
-                        df.loc[df['Ticker'] == selected, 'Fair_Value_EUR'] = new_fv_eur
-                        df.loc[df['Ticker'] == selected, '_fv_usd'] = new_fv_usd
+                        df.loc[df['Ticker'] == selected, 'Fair_Value_EUR'] = fv_eur_rounded
+                        df.loc[df['Ticker'] == selected, '_fv_usd'] = fv_usd_rounded
                         df.loc[df['Ticker'] == selected, 'Upside_PCT'] = \
-                            ((new_fv_eur - df.loc[df['Ticker'] == selected, 'Kurs_EUR'].values[0]) / 
+                            ((fv_eur_rounded - df.loc[df['Ticker'] == selected, 'Kurs_EUR'].values[0]) / 
                              df.loc[df['Ticker'] == selected, 'Kurs_EUR'].values[0]) * 100
                         
                         # Refresh nur die Ranking Tabelle
@@ -371,9 +390,9 @@ try:
                                 hide_index=True
                             )
                         
-                        time.sleep(0.5)
+                        time.sleep(0.3)
                     else:
-                        st.error("❌ Fehler beim Speichern")
+                        st.error("❌ DB Error")
             
             st.divider()
             
