@@ -79,42 +79,70 @@ def calculate_avg_drawdown(hist: pd.DataFrame) -> float:
     significant_drawdowns = drawdown[drawdown < DRAWDOWN_THRESHOLD]
     return significant_drawdowns.mean() * 100 if not significant_drawdowns.empty else 0.0
 
-def calculate_historical_kgv_median(hist: pd.DataFrame, info: dict) -> tuple[float, float]:
-    """SCHRITT 2: Ermittle den historischen KGV-Schnitt (10-Jahres-Median)"""
+def calculate_kgv_trend(hist: pd.DataFrame, info: dict) -> tuple[float, float]:
+    """
+    Berechne KGV aktuell und KGV Trend (nächster Punkt)
+    - KGV aktuell: Basierend auf aktuellem Kurs und EPS
+    - KGV nächster Punkt: Median der letzten 2 Jahre (Trend)
+    """
     try:
         eps_ttm = info.get('trailingEps') or 1.0
-        
         if eps_ttm <= 0:
-            kgv_median = info.get('forwardPE') or FALLBACK_KGV
-            kgv_lower = kgv_median * 0.8
-            return kgv_median, kgv_lower
+            eps_ttm = 1.0
         
-        hist_10y = hist.tail(2520)
+        price_usd = info.get('currentPrice') or hist['Close'].iloc[-1]
+        kgv_current = price_usd / eps_ttm
         
-        if not hist_10y.empty and len(hist_10y) > 100:
-            kgv_series = hist_10y['Close'] / eps_ttm
-            kgv_median = kgv_series.median()
+        # KGV Trend: Median der letzten 2 Jahre
+        hist_2y = hist.tail(504)  # ~2 Jahre
+        if not hist_2y.empty and len(hist_2y) > 50:
+            kgv_series = hist_2y['Close'] / eps_ttm
+            kgv_trend = kgv_series.median()
             
-            if kgv_median <= 0 or kgv_median > 1000:
-                kgv_median = info.get('forwardPE') or FALLBACK_KGV
+            # Validierung
+            if kgv_trend <= 0 or kgv_trend > 1000:
+                kgv_trend = kgv_current
         else:
-            kgv_median = info.get('forwardPE') or FALLBACK_KGV
+            kgv_trend = kgv_current
         
-        kgv_lower = kgv_median * 0.8
-        return kgv_median, kgv_lower
+        return kgv_current, kgv_trend
             
     except Exception:
-        kgv_median = info.get('forwardPE') or FALLBACK_KGV
-        kgv_lower = kgv_median * 0.8
-        return kgv_median, kgv_lower
+        return FALLBACK_KGV, FALLBACK_KGV
 
-def calculate_fair_value(eps: float, kgv_lower: float, kgv_upper: float) -> tuple[float, float, float]:
-    """SCHRITT 3 & 4: Berechne Fair-Value-Szenarien"""
-    fv_konservativ = eps * kgv_lower
-    fv_optimistisch = eps * kgv_upper
-    fv_gemittelt = (fv_konservativ + fv_optimistisch) / 2
+def calculate_fcf_per_share(info: dict) -> float:
+    """Berechne Free Cash Flow pro Aktie"""
+    try:
+        fcf = info.get('freeCashflow') or 0
+        shares = info.get('sharesOutstanding') or 1
+        if fcf > 0 and shares > 0:
+            return fcf / shares
+    except Exception:
+        pass
+    return 0.0
+
+def calculate_fair_value_dual(eps: float, fcf_per_share: float, kgv_current: float, kgv_trend: float) -> tuple[float, float, float]:
+    """
+    DUAL METHOD - wie Aktienfinder:
+    - FV bereinigt (KGV): EPS × Mittelwert(KGV aktuell, KGV trend)
+    - FV Cashflow (KCV): FCF per Share × KCV (vereinfacht: KGV * 0.9)
+    - FV Gesamt: Mittelwert beider Methoden
+    """
+    # Methode 1: KGV-basiert
+    kgv_avg = (kgv_current + kgv_trend) / 2
+    fv_kgv = eps * kgv_avg
     
-    return fv_konservativ, fv_optimistisch, fv_gemittelt
+    # Methode 2: Cashflow-basiert (KCV ≈ KGV * 0.9)
+    if fcf_per_share > 0:
+        kcv = kgv_avg * 0.9
+        fv_fcf = fcf_per_share * kcv
+    else:
+        fv_fcf = fv_kgv  # Fallback
+    
+    # Mittelwert
+    fv_gesamt = (fv_kgv + fv_fcf) / 2
+    
+    return fv_kgv, fv_fcf, fv_gesamt
 
 def calculate_technical_metrics(hist: pd.DataFrame, price_usd: float) -> dict:
     """Berechne alle technischen Metriken"""
@@ -158,7 +186,7 @@ def generate_signal(price_eur: float, fv_eur: float, rsi: float, mos_pct: float)
 
 # --- 4. HAUPTPROGRAMM ---
 db = init_db()
-st.title("💎 Equity Intelligence: Fair Value 2026")
+st.title("💎 Equity Intelligence: Fair Value (Dual-Method)")
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -195,13 +223,12 @@ try:
     eur_usd = get_eur_usd()
     all_results = []
 
-    with st.spinner(f'Lade Marktdaten für {len(tickers)} Ticker (SEQUENTIAL - Rate Limit Safe)...'):
+    with st.spinner(f'Lade Marktdaten für {len(tickers)} Ticker...'):
         start_time = time.time()
         market_data_map = {}
         
         # SEQUENZIELL laden statt parallel (verhindert Rate Limiting)
         for idx, t in enumerate(tickers):
-            st.write(f"⏳ Lade {t}... ({idx+1}/{len(tickers)})")
             time.sleep(0.5)  # Delay zwischen Requests
             data = get_market_data(t)
             if data:
@@ -214,7 +241,7 @@ try:
         st.stop()
 
     col1, col2, col3 = st.columns([2, 1, 1])
-    col1.info(f"✅ {len(market_data_map)}/{len(tickers)} Ticker geladen in {load_time:.2f}s (sequenziell)")
+    col1.info(f"✅ {len(market_data_map)}/{len(tickers)} Ticker geladen in {load_time:.2f}s")
     
     for t in tickers:
         if t not in market_data_map:
@@ -222,13 +249,16 @@ try:
 
         hist, info = market_data_map[t]
 
-        eps_2026 = info.get('forwardEps') or info.get('trailingEps') or FALLBACK_EPS
-        kgv_median, kgv_lower = calculate_historical_kgv_median(hist, info)
+        # --- BERECHNUNG ---
+        eps = info.get('trailingEps') or FALLBACK_EPS
+        fcf_per_share = calculate_fcf_per_share(info)
+        kgv_current, kgv_trend = calculate_kgv_trend(hist, info)
         price_usd = info.get('currentPrice') or hist['Close'].iloc[-1]
 
-        fv_konservativ, fv_optimistisch, fv_gemittelt = calculate_fair_value(eps_2026, kgv_lower, kgv_median)
+        # Fair Value (Dual Method)
+        fv_kgv, fv_fcf, fv_gesamt = calculate_fair_value_dual(eps, fcf_per_share, kgv_current, kgv_trend)
         
-        fv_eur = fv_gemittelt / eur_usd
+        fv_eur = fv_gesamt / eur_usd
         price_eur = price_usd / eur_usd
         upside = ((fv_eur - price_eur) / price_eur) * 100
 
@@ -245,12 +275,13 @@ try:
             "RSI": rsi_now,
             "Signal": signal,
             "_price_usd": price_usd,
-            "_fv_usd": fv_gemittelt,
-            "_fv_konservativ": fv_konservativ,
-            "_fv_optimistisch": fv_optimistisch,
-            "_kgv_median": kgv_median,
-            "_kgv_lower": kgv_lower,
-            "_eps_2026": eps_2026,
+            "_fv_gesamt_usd": fv_gesamt,
+            "_fv_kgv_usd": fv_kgv,
+            "_fv_fcf_usd": fv_fcf,
+            "_kgv_current": kgv_current,
+            "_kgv_trend": kgv_trend,
+            "_eps": eps,
+            "_fcf_per_share": fcf_per_share,
             "_corr_ath": tech_metrics['corr_ath'],
             "_avg_dd": tech_metrics['avg_dd'],
             "_trend": tech_metrics['trend'],
@@ -289,25 +320,34 @@ try:
             row = df[df['Ticker'] == selected].iloc[0]
             hist, _ = market_data_map[selected]
 
-            st.subheader(f"Fair-Value-Methode: {selected}")
-            fv_col1, fv_col2, fv_col3, fv_col4 = st.columns(4)
-            fv_col1.metric("EPS 2026", f"${row['_eps_2026']:.2f}")
-            fv_col2.metric("Unteres KGV (-20%)", f"{row['_kgv_lower']:.1f}x")
-            fv_col3.metric("Oberes KGV", f"{row['_kgv_median']:.1f}x")
-            fv_col4.metric("Gem. Fair Value", f"${row['_fv_usd']:.2f}")
+            st.subheader(f"Fair-Value-Analyse: {selected} (Dual-Method)")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("EPS (TTM)", f"${row['_eps']:.2f}")
+            col2.metric("KGV aktuell", f"{row['_kgv_current']:.1f}x")
+            col3.metric("KGV Trend", f"{row['_kgv_trend']:.1f}x")
+            col4.metric("FCF/Share", f"${row['_fcf_per_share']:.2f}")
             
             st.markdown(f"""
-            **Berechnung (10-Jahres-Median KGV):**
-            - Konservativ: ${row['_eps_2026']:.2f} × {row['_kgv_lower']:.1f}x = **${row['_fv_konservativ']:.2f}**
-            - Optimistisch: ${row['_eps_2026']:.2f} × {row['_kgv_median']:.1f}x = **${row['_fv_optimistisch']:.2f}**
-            - Gemittelt: (${row['_fv_konservativ']:.2f} + ${row['_fv_optimistisch']:.2f}) / 2 = **${row['_fv_usd']:.2f}**
+            **Dual-Method Berechnung:**
+            
+            **Methode 1 - KGV-basiert:**
+            - KGV Ø = ({row['_kgv_current']:.1f} + {row['_kgv_trend']:.1f}) / 2 = **{(row['_kgv_current'] + row['_kgv_trend'])/2:.1f}x**
+            - FV = ${row['_eps']:.2f} × {(row['_kgv_current'] + row['_kgv_trend'])/2:.1f} = **${row['_fv_kgv_usd']:.2f}**
+            
+            **Methode 2 - Cashflow-basiert:**
+            - KCV = KGV Ø × 0.9 = **{(row['_kgv_current'] + row['_kgv_trend'])/2 * 0.9:.1f}**
+            - FV = ${row['_fcf_per_share']:.2f} × {(row['_kgv_current'] + row['_kgv_trend'])/2 * 0.9:.1f} = **${row['_fv_fcf_usd']:.2f}**
+            
+            **Fair Value Gesamt (Mittelwert):**
+            - (${row['_fv_kgv_usd']:.2f} + ${row['_fv_fcf_usd']:.2f}) / 2 = **${row['_fv_gesamt_usd']:.2f}** ≈ **€{row['Fair Value (€)']:.2f}**
             """)
 
             st.divider()
 
             col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("Kurs", f"{row['_price_usd']:.2f} $", delta=f"≈ {row['Kurs (€)']:.2f} €", delta_color="off")
-            col2.metric("Fair Value Ø", f"{row['_fv_usd']:.2f} $", delta=f"≈ {row['Fair Value (€)']:.2f} €", delta_color="off")
+            col2.metric("Fair Value", f"{row['_fv_gesamt_usd']:.2f} $", delta=f"≈ {row['Fair Value (€)']:.2f} €", delta_color="off")
             
             rsi_status = "Überverkauft (<30)" if row['RSI'] < 30 else ("Kaufzone (<40)" if row['RSI'] < 40 else "Neutral")
             col3.metric("RSI (14)", f"{row['RSI']:.1f}", delta=rsi_status, delta_color="inverse")
@@ -355,7 +395,7 @@ try:
                 row=1, col=1
             )
             fig.add_hline(y=fv_eur, line_dash="dash", line_color="#28a745",
-                         annotation_text="Fair Value (Ø)", row=1, col=1)
+                         annotation_text="Fair Value", row=1, col=1)
 
             rsi = ta.rsi(hist['Close'], length=RSI_LENGTH)
             fig.add_trace(
@@ -371,7 +411,7 @@ try:
                 height=600,
                 template="plotly_dark",
                 hovermode="x unified",
-                title=f"Chartanalyse: {selected} (maximale Historie)",
+                title=f"Chartanalyse: {selected}",
                 xaxis_rangeslider_visible=False
             )
             fig.update_yaxes(title_text="Preis (€)", row=1, col=1)
