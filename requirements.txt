@@ -3,3 +3,4 @@ pandas
 yfinance
 supabase
 numpy
+pandas_ta
