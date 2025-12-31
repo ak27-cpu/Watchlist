@@ -2,100 +2,92 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
-from supabase import create_client, Client
+from supabase import create_client
 
-# --- SETUP & CONFIG ---
-st.set_page_config(page_title="Aktien Watchlist PRO", layout="wide")
-
+# --- KONFIGURATION ---
+# Ersetze diese Werte mit deinen echten Supabase-Daten (zu finden unter Project Settings -> API)
+SUPABASE_URL = "DEINE_URL"
+SUPABASE_KEY = "DEIN_KEY"
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 TICKERS = ["NVDA", "TSM", "V", "ASML", "GOOGL"]
 
-def get_exchange_rate():
-    return yf.Ticker("EURUSD=X").fast_info['last_price']
-
-def calculate_metrics(ticker_symbol, eur_usd):
+def get_financial_data(ticker_symbol):
     stock = yf.Ticker(ticker_symbol)
-    hist = stock.history(period="max")
-    hist_20d = stock.history(period="20d")
+    eur_usd = yf.Ticker("EURUSD=X").fast_info['last_price']
+    
+    # 1. Kurs & ATH Daten
+    df_hist = stock.history(period="20y")
+    current_price_usd = df_hist['Close'].iloc[-1]
+    ath_usd = df_hist['Close'].max()
+    
+    # 2. Historische Durchschnittskorrektur (Max Drawdown over time)
+    # Wir berechnen das rollierende Maximum und davon die Abweichung
+    roll_max = df_hist['Close'].cummax()
+    drawdowns = (df_hist['Close'] - roll_max) / roll_max
+    avg_drawdown = drawdowns.mean() * 100 # Durchschnittliche "Tiefe" über 20J
+    
+    # 3. Fair Value Logik (EPS 2026 & KGV Median)
     info = stock.info
+    fwd_eps = info.get('forwardEps', 1) 
+    # Schätzung für 2026 (basiert auf 15% Wachstum p.a. falls Konsens nicht greifbar)
+    eps_2026 = fwd_eps * 1.15 
+    kgv_median = info.get('trailingPE', 25) # Nutzt Trailing PE als Basis für Median
     
-    # 1. Kursdaten
-    price_usd = info.get('currentPrice') or info.get('regularMarketPrice')
-    price_eur = price_usd / eur_usd
-    
-    # 2. Fair Value Berechnung (EPS 2026 & KGV Median)
-    # Hinweis: yfinance liefert EPS Estimates oft unter 'forwardEps'
-    eps_2026 = info.get('forwardEps', 0) * 1.15 # Grobe Annäherung, da Konsens 2026 oft fehlt
-    kgv_median = info.get('forwardPE', 20) # Fallback auf Forward PE
-    
-    fv_usd_low = eps_2026 * (kgv_median * 0.8)
-    fv_usd_high = eps_2026 * kgv_median
-    fv_usd_avg = (fv_usd_low + fv_usd_high) / 2
-    fv_eur = fv_usd_avg / eur_usd
-    
-    # 3. ATH & Tranchen
-    ath = hist['Close'].max()
-    tranche1 = (ath * 0.9) / eur_usd
-    tranche2 = (ath * 0.8) / eur_usd
-    corr_pct = ((price_usd - ath) / ath) * 100
+    fv_usd = ( (eps_2026 * (kgv_median * 0.8)) + (eps_2026 * kgv_median) ) / 2
     
     # 4. Technische Indikatoren
-    df_tech = stock.history(period="60d")
-    rsi = ta.rsi(df_tech['Close'], length=14).iloc[-1]
-    adx_df = ta.adx(df_tech['High'], df_tech['Low'], df_tech['Close'], length=14)
+    df_recent = df_hist.tail(60).copy()
+    rsi = ta.rsi(df_recent['Close'], length=14).iloc[-1]
+    adx_df = ta.adx(df_recent['High'], df_recent['Low'], df_recent['Close'], length=14)
     adx = adx_df['ADX_14'].iloc[-1]
     
-    avg_vol = df_tech['Volume'].tail(20).mean()
-    curr_vol = df_tech['Volume'].iloc[-1]
+    # Volumen Analyse
+    vol_20ma = df_recent['Volume'].rolling(20).mean().iloc[-1]
+    curr_vol = df_recent['Volume'].iloc[-1]
+    vol_ratio = curr_vol / vol_20ma
+    vol_status = "Buy" if vol_ratio > 1.5 else ("Sell" if vol_ratio < 0.8 else "Hold")
+
+    # 5. Währungsumrechnung
+    price_eur = current_price_usd / eur_usd
+    fv_eur = fv_usd / eur_usd
     
-    # 5. Logik
+    # 6. Bewertung
     upside = ((fv_eur - price_eur) / price_eur) * 100
+    corr_now = ((current_price_usd - ath_usd) / ath_usd) * 100
     
-    # Bewertungstext
-    vol_status = "Buy" if curr_vol > 1.5 * avg_vol else ("Sell" if curr_vol < 0.8 * avg_vol else "Neutral")
-    trend = "Stark" if adx > 25 else ("Mittel" if adx > 20 else "Schwach")
-    
-    if upside > 10 and rsi < 50 and vol_status == "Buy" and corr_pct > -15:
+    if upside > 10 and rsi < 50 and vol_status == "Buy" and corr_now > -15:
         rating = "🟢 KAUF"
-    elif 0 <= upside <= 10 and 40 <= rsi <= 70 and trend == "Mittel":
+    elif 0 <= upside <= 10 and 40 <= rsi <= 70:
         rating = "🟡 BEOBACHTEN"
     else:
         rating = "🔴 WARTEN"
 
     return {
-        "Ticker": ticker_symbol,
-        "Kurs(€)": round(price_eur, 2),
-        "Fair Value(€)": round(fv_eur, 2),
-        "Tranche1(-10%)": round(tranche1, 2),
-        "Tranche2(-20%)": round(tranche2, 2),
-        "Bewertung": rating,
-        "RSI(14)": round(rsi, 1),
-        "Korrektur vs ATH": f"{round(corr_pct, 1)}%",
-        "Trend": trend,
-        "Volumen": vol_status
+        "ticker": ticker_symbol,
+        "kurs_eur": round(price_eur, 2),
+        "fv_eur": round(fv_eur, 2),
+        "tranche1": round((ath_usd * 0.9) / eur_usd, 2),
+        "tranche2": round((ath_usd * 0.8) / eur_usd, 2),
+        "bewertung": rating,
+        "rsi": round(rsi, 1),
+        "corr_ath": round(corr_now, 1),
+        "hist_corr": round(avg_drawdown, 1),
+        "trend": "Stark" if adx > 25 else "Schwach",
+        "volumen": vol_status
     }
 
-# --- APP UI ---
-st.title("🚀 Smart Watchlist & Fair Value Analyzer")
+# --- UI ---
+st.title("Finanz-Dashboard & Supabase Sync")
 
-if st.button("Daten aktualisieren"):
-    eur_usd = get_exchange_rate()
+if st.button("Marktdaten scannen"):
     results = []
-    
-    with st.spinner('Berechne Daten...'):
-        for t in TICKERS:
-            data = calculate_metrics(t, eur_usd)
+    for t in TICKERS:
+        with st.status(f"Analysiere {t}...", expanded=False):
+            data = get_financial_data(t)
             results.append(data)
-            
-            # Sync to Supabase
-            supabase.table("watchlist").upsert({
-                "ticker": t,
-                "last_price_eur": data["Kurs(€)"],
-                "fair_value_eur": data["Fair Value(€)"],
-                "status": data["Bewertung"]
-            }).execute()
-            
-    df = pd.DataFrame(results)
-    st.table(df)
-else:
-    st.info("Klicke auf den Button, um die Analyse zu starten.")
+            # Sync mit deiner bestehenden Supabase Tabelle
+            # WICHTIG: Spaltennamen in .upsert({}) müssen exakt wie in Supabase sein!
+            supabase.table("DEIN_TABELLEN_NAME").upsert(data).execute()
+    
+    st.table(pd.DataFrame(results))
