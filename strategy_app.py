@@ -5,71 +5,63 @@ import pandas_ta as ta
 import plotly.graph_objects as go
 from supabase import create_client, Client
 
-# --- SETUP ---
-st.set_page_config(page_title="Strategy Watchlist", layout="wide")
+# --- BERECHNUNGS-LOGIK (SCHRITT 1-4) ---
 
-# Supabase Verbindung sicher laden
-try:
-    URL = st.secrets["SUPABASE_URL"]
-    KEY = st.secrets["SUPABASE_KEY"]
-    supabase: Client = create_client(URL, KEY)
-except Exception as e:
-    st.error("⚠️ Supabase Secrets fehlen in der Streamlit Cloud!")
-    st.stop()
-
-def get_live_eur_usd():
-    """Holt aktuellen EUR/USD Kurs."""
+def get_exchange_rate():
+    """Holt den aktuellen EUR/USD Kurs."""
     try:
-        data = yf.download("EURUSD=X", period="1d", interval="1m", progress=False)
-        return data['Close'].iloc[-1]
+        ticker = yf.Ticker("EURUSD=X")
+        return ticker.history(period="1d")['Close'].iloc[-1]
     except:
-        return 1.08 # Fallback falls API hakt
+        return 1.05  # Sicherer Fallback
 
-def calculate_metrics(ticker_symbol, eur_usd):
+def calculate_fair_value(ticker_symbol, eur_usd):
     try:
         tk = yf.Ticker(ticker_symbol)
-        # Schnellerer Download der Kursdaten
-        hist = tk.history(period="max")
-        if hist.empty: return None
-        
         info = tk.info
-        df_ta = hist.tail(60).copy()
+        hist_max = tk.history(period="max")
+        hist_60d = tk.history(period="60d")
         
-        # 1. EPS 2026 Logik (Deine Formel)
-        # Wir nehmen das forwardEps und rechnen es 2 Jahre hoch
-        current_eps = info.get('forwardEps') or info.get('trailingEps') or 1.0
-        growth = info.get('longTermOutlookValue', 0.1) # Default 10%
-        eps_2026 = current_eps * (1 + growth)**2
+        if hist_max.empty:
+            return None
+
+        # 1. EPS 2026 (Analysten-Konsens oder Extrapolation)
+        # Wir nutzen forwardEps und das erwartete Wachstum (growth)
+        fwd_eps = info.get('forwardEps') or info.get('trailingEps') or 1.0
+        growth = info.get('earningsGrowth', 0.12) # Fallback 12% p.a.
+        eps_2026 = fwd_eps * (1 + growth)**2
         
-        # 2. KGV Spanne (10J Median Proxy)
-        hist_pe = info.get('forwardPE') or info.get('trailingPE') or 15
-        unteres_kgv = hist_pe * 0.8
-        oberes_kgv = hist_pe
+        # 2. Historisches KGV (10J Median Proxy)
+        # Wir nutzen das aktuelle forwardPE als Basis für die Spanne
+        base_pe = info.get('forwardPE') or info.get('trailingPE') or 18
+        unteres_kgv = base_pe * 0.8  # 20% Sicherheitsabschlag
+        oberes_kgv = base_pe
         
-        # 3. Fair Value (USD & EUR)
-        fv_usd = (eps_2026 * unteres_kgv + eps_2026 * oberes_kgv) / 2
-        price_usd = info.get('currentPrice') or hist['Close'].iloc[-1]
+        # 3. Fair Value Berechnung (Szenarien)
+        fv_usd_konservativ = eps_2026 * unteres_kgv
+        fv_usd_optimistisch = eps_2026 * oberes_kgv
+        gemittelter_fv_usd = (fv_usd_konservativ + fv_usd_optimistisch) / 2
         
-        fv_eur = fv_usd / eur_usd
+        # 4. Umrechnungen & Kurse
+        price_usd = info.get('currentPrice') or hist_max['Close'].iloc[-1]
         price_eur = price_usd / eur_usd
+        fv_eur = gemittelter_fv_usd / eur_usd
         
-        # 4. ATH & Tranchen
-        ath_usd = hist['High'].max()
-        tranche1 = (ath_usd * 0.9) / eur_usd
-        tranche2 = (ath_usd * 0.8) / eur_usd
+        # Weitere Metriken (ATH, RSI, Volumen)
+        ath_usd = hist_max['High'].max()
+        ath_eur = ath_usd / eur_usd
         corr_ath = ((price_usd - ath_usd) / ath_usd) * 100
         
-        # 5. Technische Metriken
-        rsi = ta.rsi(df_ta['Close'], length=14).iloc[-1]
-        adx_df = ta.adx(df_ta['High'], df_ta['Low'], df_ta['Close'])
+        rsi = ta.rsi(hist_60d['Close'], length=14).iloc[-1]
+        adx_df = ta.adx(hist_60d['High'], hist_60d['Low'], hist_60d['Close'])
         adx = adx_df['ADX_14'].iloc[-1]
         
-        vol_now = df_ta['Volume'].iloc[-1]
-        vol_ma = df_ta['Volume'].mean()
+        vol_now = hist_60d['Volume'].iloc[-1]
+        vol_ma = hist_60d['Volume'].tail(20).mean()
         vol_sig = "Buy" if vol_now > (vol_ma * 1.5) else "Sell" if vol_now < (vol_ma * 0.8) else "Hold"
-
+        
         # Bewertung (Deine Logik)
-        upside = ((fv_usd - price_usd) / price_usd) * 100
+        upside = ((gemittelter_fv_usd - price_usd) / price_usd) * 100
         if upside > 10 and rsi < 40 and vol_sig == "Buy":
             bewertung = "🟢 KAUF"
         elif 0 <= upside <= 10:
@@ -80,63 +72,99 @@ def calculate_metrics(ticker_symbol, eur_usd):
         return {
             "Ticker": ticker_symbol,
             "Kurs(€)": round(float(price_eur), 2),
-            "Fair Value($)": round(float(fv_usd), 2),
+            "Fair Value(USD)": round(float(gemittelter_fv_usd), 2),
             "Fair Value(€)": round(float(fv_eur), 2),
-            "Tranche1(-10%)": round(float(tranche1), 2),
-            "Tranche2(-20%)": round(float(tranche2), 2),
+            "Tranche1(-10%)": round(float(ath_eur * 0.9), 2),
+            "Tranche2(-20%)": round(float(ath_eur * 0.8), 2),
             "Bewertung": bewertung,
             "RSI(14)": round(float(rsi), 1),
-            "Korrektur(%)": f"{round(float(corr_ath), 1)}%",
-            "Trend": "Stark" if adx > 25 else "Schwach",
+            "Korrektur vs ATH(%)": f"{round(float(corr_ath), 1)}%",
+            "Trend": "Stark" if adx > 25 else "Mittel" if adx > 20 else "Schwach",
             "Volumen": vol_sig
         }
     except Exception as e:
-        st.warning(f"Fehler bei {ticker_symbol}: {e}")
+        st.error(f"Fehler bei Ticker {ticker_symbol}: {e}")
         return None
 
-# --- UI ---
-st.title("📊 My Strategy Watchlist")
+# --- STREAMLIT UI ---
 
-if st.button("🔄 Daten aktualisieren"):
-    st.cache_data.clear()
-    st.rerun()
+st.set_page_config(page_title="Stock Analysis Strategy", layout="wide")
+st.title("📈 Watchlist & Fair Value Analyse")
 
-# Ticker aus Supabase laden
+# 1. Verbindung zu Supabase
 try:
-    res = supabase.table("watchlist").select("ticker").execute()
-    tickers = [item['ticker'] for item in res.data]
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    supabase: Client = create_client(url, key)
 except Exception as e:
-    st.error(f"Datenbankfehler: {e}")
+    st.error("⚠️ Secrets (URL/KEY) nicht gefunden oder fehlerhaft!")
+    st.stop()
+
+# 2. Daten laden
+eur_usd = get_exchange_rate()
+
+# Versuche Ticker aus der Tabelle "watchlist" zu laden
+try:
+    # .table("watchlist") muss exakt so heißen wie in Supabase (meist kleingeschrieben)
+    response = supabase.table("watchlist").select("ticker").execute()
+    tickers = [item['ticker'] for item in response.data]
+except Exception as e:
+    st.error(f"Konnte Tabelle 'watchlist' nicht finden. Fehler: {e}")
     tickers = []
 
 if tickers:
-    eur_usd = get_live_eur_usd()
-    all_data = []
+    st.info(f"Analysiere {len(tickers)} Aktien aus der Datenbank...")
     
-    with st.spinner("Analysiere Märkte..."):
-        for t in tickers:
-            data = calculate_metrics(t, eur_usd)
-            if data: all_data.append(data)
-
-    if all_data:
-        df = pd.DataFrame(all_data)
+    results = []
+    # Ladebalken für die Analyse
+    progress_bar = st.progress(0)
+    for i, t in enumerate(tickers):
+        data = calculate_fair_value(t, eur_usd)
+        if data:
+            results.append(data)
+        progress_bar.progress((i + 1) / len(tickers))
+    
+    if results:
+        df = pd.DataFrame(results)
+        
+        # Tabelle anzeigen
+        st.subheader("Übersicht")
         st.dataframe(df, use_container_width=True, hide_index=True)
         
-        # Grafik Sektion
-        st.subheader("Visualer Check: Kurs vs. Fair Value (€)")
+        # Visualisierung
+        st.divider()
+        st.subheader("Grafische Auswertung: Kurs im Verhältnis zum Fair Value (€)")
+        
+        # Grid Layout für Charts
         cols = st.columns(3)
-        for idx, row in df.iterrows():
-            with cols[idx % 3]:
+        for i, row in df.iterrows():
+            with cols[i % 3]:
                 fig = go.Figure(go.Indicator(
-                    mode="gauge+number",
-                    value=row['Kurs(€)'],
-                    title={'text': row['Ticker']},
-                    gauge={
-                        'axis': {'range': [0, row['Fair Value(€)'] * 1.5]},
-                        'threshold': {'line': {'color': "green", 'width': 4}, 'value': row['Fair Value(€)']}
+                    mode = "gauge+number",
+                    value = row['Kurs(€)'],
+                    title = {'text': f"{row['Ticker']}"},
+                    gauge = {
+                        'axis': {'range': [0, max(row['Fair Value(€)'], row['Kurs(€)']) * 1.3]},
+                        'bar': {'color': "black"},
+                        'steps': [
+                            {'range': [0, row['Fair Value(€)']], 'color': "#c8e6c9"},
+                            {'range': [row['Fair Value(€)'], 9999], 'color': "#ffcdd2"}
+                        ],
+                        'threshold': {
+                            'line': {'color': "green", 'width': 4},
+                            'thickness': 0.75,
+                            'value': row['Fair Value(€)']
+                        }
                     }
                 ))
-                fig.update_layout(height=200, margin=dict(l=10, r=10, t=40, b=10))
+                fig.update_layout(height=250, margin=dict(l=20, r=20, t=50, b=20))
                 st.plotly_chart(fig, use_container_width=True)
 else:
-    st.info("Keine Ticker in der Supabase 'watchlist' Tabelle gefunden.")
+    st.warning("Keine Ticker gefunden. Prüfe, ob die Tabelle 'watchlist' Daten enthält.")
+
+# Sidebar zum schnellen Hinzufügen (optionaler Test)
+with st.sidebar:
+    st.header("Admin")
+    if st.button("Cache leeren & Neu laden"):
+        st.cache_data.clear()
+        st.rerun()
