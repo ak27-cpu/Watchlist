@@ -351,7 +351,8 @@ try:
             - PV (Cash Flows Jahre 1-10): **${row['_pv_10y']:.2f}**
             - PV (Terminal Value): **${row['_pv_terminal']:.2f}**
             
-            **Fair Value Gesamt: ${row['_fv_usd']:.2f}} ≈ €{row['Fair Value (€)']:.2f}}**
+            **Fair Value Gesamt: ${row['_fv_usd']:.2f} ≈ €{row['Fair Value (€)']:.2f}**
+
             
             **Einschätzung:**
             - Aktueller Kurs: **€{row['Kurs (€)']:.2f}}**
