@@ -63,14 +63,18 @@ def get_watchlist():
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_eur_usd():
-    """EUR/USD Kurs laden mit Fallback"""
+    """EUR/USD Kurs laden mit Fallback (Rate Limit Safe)"""
     try:
         eur_usd_data = yf.download("EURUSD=X", period="1d", progress=False)
         if not eur_usd_data.empty:
-            return float(eur_usd_data['Close'].iloc[-1])
+            rate = float(eur_usd_data['Close'].iloc[-1])
+            if 0.9 < rate < 1.2:  # Sanity check
+                return rate
     except Exception:
         pass
-    return FALLBACK_EUR_USD
+    # Fallback: Hardcodierter Wert (aktuell ~1.055)
+    return 1.055
+
 
 def calculate_avg_drawdown(hist: pd.DataFrame) -> float:
     """Berechne durchschnittlichen Drawdown > 10%"""
