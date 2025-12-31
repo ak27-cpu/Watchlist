@@ -7,6 +7,7 @@ from plotly.subplots import make_subplots
 from supabase import create_client, Client
 from concurrent.futures import ThreadPoolExecutor
 import time
+import numpy as np
 
 # --- 1. SETUP & STYLE ---
 st.set_page_config(page_title="Equity Intelligence Pro", layout="wide")
@@ -35,10 +36,12 @@ MAX_WORKERS = 8
 # --- 3. HILFSFUNKTIONEN ---
 @st.cache_resource
 def init_db():
+    """Initialisiere Datenbank einmalig"""
     return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_market_data(ticker: str) -> tuple | None:
+    """Lade maximale historische Daten (period='max')"""
     try:
         tk = yf.Ticker(ticker)
         hist = tk.history(period="max")
@@ -51,6 +54,7 @@ def get_market_data(ticker: str) -> tuple | None:
 
 @st.cache_data(ttl=WATCHLIST_CACHE_TTL, show_spinner=False)
 def get_watchlist():
+    """Watchlist aus Supabase laden und 10 Minuten cachen"""
     db = init_db()
     try:
         res = db.table("watchlist").select("ticker").execute()
@@ -62,6 +66,7 @@ def get_watchlist():
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_eur_usd():
+    """EUR/USD Kurs laden, separat gecacht"""
     try:
         eur_usd_data = yf.download("EURUSD=X", period="1d", progress=False)
         if not eur_usd_data.empty:
@@ -71,6 +76,7 @@ def get_eur_usd():
     return FALLBACK_EUR_USD
 
 def load_all_market_data(tickers):
+    """Lädt Marktdaten für alle Ticker parallel mit ThreadPoolExecutor"""
     results = {}
     workers = min(MAX_WORKERS, len(tickers))
     
@@ -89,12 +95,72 @@ def load_all_market_data(tickers):
     return results
 
 def calculate_avg_drawdown(hist: pd.DataFrame) -> float:
+    """Berechne durchschnittlichen Drawdown > 10%"""
     running_max = hist['Close'].cummax()
     drawdown = (hist['Close'] - running_max) / running_max
     significant_drawdowns = drawdown[drawdown < DRAWDOWN_THRESHOLD]
     return significant_drawdowns.mean() * 100 if not significant_drawdowns.empty else 0.0
 
+def calculate_historical_kgv_median(hist: pd.DataFrame, info: dict) -> tuple[float, float]:
+    """
+    SCHRITT 2: Ermittle den historischen KGV-Schnitt (10-Jahres-Median) aus maximaler Historie
+    
+    Returns: (kgv_median, kgv_lower)
+    - kgv_median: Oberes KGV (normal/optimistisch)
+    - kgv_lower: Unteres KGV (Median × 0.8 = -20% Sicherheitsabschlag konservativ)
+    """
+    try:
+        eps_ttm = info.get('trailingEps') or 1.0
+        
+        if eps_ttm <= 0:
+            kgv_median = info.get('forwardPE') or FALLBACK_KGV
+            kgv_lower = kgv_median * 0.8
+            return kgv_median, kgv_lower
+        
+        # Nutze maximale Historie (bis zu 10+ Jahren)
+        hist_10y = hist.tail(2520)  # ~10 Jahre à 252 Handelstage/Jahr
+        
+        if not hist_10y.empty and len(hist_10y) > 100:
+            # Berechne KGV für jeden Tag: Close / EPS
+            # (Vereinfacht: nutze TTM EPS als konstant, idealerweise würde man historische EPS nutzen)
+            kgv_series = hist_10y['Close'] / eps_ttm
+            
+            # Berechne Median über 10 Jahre
+            kgv_median = kgv_series.median()
+            
+            # Validierung: Falls KGV unrealistisch ist
+            if kgv_median <= 0 or kgv_median > 1000:
+                kgv_median = info.get('forwardPE') or FALLBACK_KGV
+        else:
+            kgv_median = info.get('forwardPE') or FALLBACK_KGV
+        
+        # Unteres KGV: -20% Sicherheitsabschlag
+        kgv_lower = kgv_median * 0.8
+        
+        return kgv_median, kgv_lower
+            
+    except Exception:
+        kgv_median = info.get('forwardPE') or FALLBACK_KGV
+        kgv_lower = kgv_median * 0.8
+        return kgv_median, kgv_lower
+
+def calculate_fair_value(eps: float, kgv_lower: float, kgv_upper: float) -> tuple[float, float, float]:
+    """
+    SCHRITT 3 & 4: Berechne Fair-Value-Szenarien:
+    - Konservativ: EPS 2026 × unteres KGV
+    - Optimistisch: EPS 2026 × oberes KGV
+    - Gemittelt: Mittelwert aus beiden Szenarien
+    
+    Returns: (fv_konservativ, fv_optimistisch, fv_gemittelt)
+    """
+    fv_konservativ = eps * kgv_lower
+    fv_optimistisch = eps * kgv_upper
+    fv_gemittelt = (fv_konservativ + fv_optimistisch) / 2
+    
+    return fv_konservativ, fv_optimistisch, fv_gemittelt
+
 def calculate_technical_metrics(hist: pd.DataFrame, price_usd: float) -> dict:
+    """Berechne alle technischen Metriken in einer Funktion"""
     metrics = {}
     metrics['rsi'] = ta.rsi(hist['Close'], length=RSI_LENGTH).iloc[-1]
     
@@ -122,6 +188,7 @@ def calculate_technical_metrics(hist: pd.DataFrame, price_usd: float) -> dict:
     return metrics
 
 def generate_signal(price_eur: float, fv_eur: float, rsi: float, mos_pct: float) -> tuple[str, int]:
+    """Generiere Kauf-Signal und Ranking"""
     buy_limit = fv_eur * (1 - mos_pct)
     watch_limit = fv_eur * (1 + mos_pct)
     
@@ -131,10 +198,6 @@ def generate_signal(price_eur: float, fv_eur: float, rsi: float, mos_pct: float)
         return "🟡 BEOBACHTEN", 2
     else:
         return "🔴 WARTEN", 3
-
-def calculate_fair_value(eps: float, kgv_normal: float) -> float:
-    kgv_konservativ = kgv_normal * 0.8
-    return ((eps * kgv_konservativ) + (eps * kgv_normal)) / 2
 
 # --- 4. HAUPTPROGRAMM ---
 db = init_db()
@@ -175,7 +238,7 @@ try:
     eur_usd = get_eur_usd()
     all_results = []
 
-    with st.spinner(f'Lade Marktdaten parallel für {len(tickers)} Ticker...'):
+    with st.spinner(f'Lade maximale Marktdaten parallel für {len(tickers)} Ticker...'):
         start_time = time.time()
         market_data_map = load_all_market_data(tickers)
         load_time = time.time() - start_time
@@ -193,18 +256,26 @@ try:
 
         hist, info = market_data_map[t]
 
+        # --- SCHRITT 1: EPS 2026 ---
         eps_2026 = info.get('forwardEps') or info.get('trailingEps') or FALLBACK_EPS
-        kgv_normal = info.get('forwardPE') or FALLBACK_KGV
+        
+        # --- SCHRITT 2: 10-Jahres-Median KGV ---
+        kgv_median, kgv_lower = calculate_historical_kgv_median(hist, info)
+        
         price_usd = info.get('currentPrice') or hist['Close'].iloc[-1]
 
-        fv_usd = calculate_fair_value(eps_2026, kgv_normal)
-        fv_eur = fv_usd / eur_usd
+        # --- SCHRITT 3 & 4: Fair Value Szenarien ---
+        fv_konservativ, fv_optimistisch, fv_gemittelt = calculate_fair_value(eps_2026, kgv_lower, kgv_median)
+        
+        fv_eur = fv_gemittelt / eur_usd
         price_eur = price_usd / eur_usd
         upside = ((fv_eur - price_eur) / price_eur) * 100
 
+        # Technische Metriken
         tech_metrics = calculate_technical_metrics(hist, price_usd)
         rsi_now = tech_metrics['rsi']
 
+        # Signal
         signal, rank = generate_signal(price_eur, fv_eur, rsi_now, mos_pct)
 
         all_results.append({
@@ -215,7 +286,12 @@ try:
             "RSI": rsi_now,
             "Signal": signal,
             "_price_usd": price_usd,
-            "_fv_usd": fv_usd,
+            "_fv_usd": fv_gemittelt,
+            "_fv_konservativ": fv_konservativ,
+            "_fv_optimistisch": fv_optimistisch,
+            "_kgv_median": kgv_median,
+            "_kgv_lower": kgv_lower,
+            "_eps_2026": eps_2026,
             "_corr_ath": tech_metrics['corr_ath'],
             "_avg_dd": tech_metrics['avg_dd'],
             "_trend": tech_metrics['trend'],
@@ -254,6 +330,24 @@ try:
             row = df[df['Ticker'] == selected].iloc[0]
             hist, _ = market_data_map[selected]
 
+            # --- FAIR-VALUE DETAILS ---
+            st.subheader(f"Fair-Value-Methode: {selected}")
+            fv_col1, fv_col2, fv_col3, fv_col4 = st.columns(4)
+            fv_col1.metric("EPS 2026", f"${row['_eps_2026']:.2f}")
+            fv_col2.metric("Unteres KGV (-20%)", f"{row['_kgv_lower']:.1f}x")
+            fv_col3.metric("Oberes KGV", f"{row['_kgv_median']:.1f}x")
+            fv_col4.metric("Gem. Fair Value", f"${row['_fv_usd']:.2f}")
+            
+            st.markdown(f"""
+            **Berechnung (10-Jahres-Median KGV):**
+            - Konservativ: ${row['_eps_2026']:.2f} × {row['_kgv_lower']:.1f}x = **${row['_fv_konservativ']:.2f}**
+            - Optimistisch: ${row['_eps_2026']:.2f} × {row['_kgv_median']:.1f}x = **${row['_fv_optimistisch']:.2f}**
+            - Gemittelt: (${row['_fv_konservativ']:.2f} + ${row['_fv_optimistisch']:.2f}) / 2 = **${row['_fv_usd']:.2f}**
+            """)
+
+            st.divider()
+
+            # --- TECHNISCHE METRIKEN ---
             col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("Kurs", f"{row['_price_usd']:.2f} $", delta=f"≈ {row['Kurs (€)']:.2f} €", delta_color="off")
             col2.metric("Fair Value Ø", f"{row['_fv_usd']:.2f} $", delta=f"≈ {row['Fair Value (€)']:.2f} €", delta_color="off")
@@ -263,6 +357,7 @@ try:
             col4.metric("Korrektur (ATH)", f"{row['_corr_ath']:.1f}%", delta=f"Ø: {row['_avg_dd']:.1f}%", delta_color="off")
             col5.metric("Trend / Vol", f"{row['_trend']}", delta=f"{row['_vol']}")
 
+            # --- CHART ---
             fig = make_subplots(
                 rows=2, cols=1,
                 shared_xaxes=True,
@@ -304,7 +399,7 @@ try:
                 row=1, col=1
             )
             fig.add_hline(y=fv_eur, line_dash="dash", line_color="#28a745",
-                         annotation_text="Fair Value", row=1, col=1)
+                         annotation_text="Fair Value (Ø)", row=1, col=1)
 
             rsi = ta.rsi(hist['Close'], length=RSI_LENGTH)
             fig.add_trace(
@@ -320,7 +415,7 @@ try:
                 height=600,
                 template="plotly_dark",
                 hovermode="x unified",
-                title=f"Chartanalyse: {selected}",
+                title=f"Chartanalyse: {selected} (maximale Historie)",
                 xaxis_rangeslider_visible=False
             )
             fig.update_yaxes(title_text="Preis (€)", row=1, col=1)
