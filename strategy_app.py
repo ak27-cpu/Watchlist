@@ -6,11 +6,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from supabase import create_client, Client
 import time
-import numpy as np
 
-# --- 1. SETUP & STYLE ---
 st.set_page_config(page_title="Equity Intelligence Pro", layout="wide")
-
 st.markdown("""
     <style>
     .stMetric { background-color: #1e2130; padding: 10px; border-radius: 8px; border: 1px solid #30363d; }
@@ -19,7 +16,6 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. KONSTANTEN ---
 CACHE_TTL = 3600
 WATCHLIST_CACHE_TTL = 600
 RSI_LENGTH = 14
@@ -28,20 +24,15 @@ VOLUME_THRESHOLD_UP = 1.5
 VOLUME_THRESHOLD_DOWN = 0.8
 DRAWDOWN_THRESHOLD = -0.10
 FALLBACK_EUR_USD = 1.055
+WACC = 0.0989
+TERMINAL_GROWTH = 0.025
 
-# DCF Parameter
-WACC = 0.0989  # 9.89% (Standard für Quality Companies)
-TERMINAL_GROWTH = 0.025  # 2.5% (langfristiges GDP-Wachstum)
-
-# --- 3. HILFSFUNKTIONEN ---
 @st.cache_resource
 def init_db():
-    """Initialisiere Datenbank einmalig"""
     return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_market_data(ticker: str) -> tuple | None:
-    """Lade maximale historische Daten"""
     try:
         tk = yf.Ticker(ticker)
         hist = tk.history(period="max")
@@ -53,7 +44,6 @@ def get_market_data(ticker: str) -> tuple | None:
 
 @st.cache_data(ttl=WATCHLIST_CACHE_TTL, show_spinner=False)
 def get_watchlist():
-    """Watchlist aus Supabase laden"""
     db = init_db()
     try:
         res = db.table("watchlist").select("ticker").execute()
@@ -64,7 +54,6 @@ def get_watchlist():
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_eur_usd():
-    """EUR/USD Kurs laden mit Fallback"""
     try:
         eur_usd_data = yf.download("EURUSD=X", period="1d", progress=False)
         if not eur_usd_data.empty:
@@ -76,7 +65,6 @@ def get_eur_usd():
     return FALLBACK_EUR_USD
 
 def calculate_fcf_per_share(info: dict) -> float:
-    """Berechne Free Cash Flow pro Aktie"""
     try:
         fcf = info.get('freeCashflow') or 0
         shares = info.get('sharesOutstanding') or 1
@@ -86,41 +74,25 @@ def calculate_fcf_per_share(info: dict) -> float:
         pass
     return 0.0
 
-def calculate_dcf_fair_value(fcf_per_share: float, growth_rate: float = 0.10, wacc: float = WACC, terminal_growth: float = TERMINAL_GROWTH) -> dict:
-    """
-    DCF-Bewertung (Buffett-Style)
-    
-    Simplified Gordon Growth Model:
-    Fair Value = FCF_pro_Share × (1 + Growth) / (WACC - Growth)
-    
-    Plus 10-Jahres Projection für Details
-    """
-    
+def calculate_dcf_fair_value(fcf_per_share: float, growth_rate: float = 0.10) -> dict:
     if fcf_per_share <= 0:
         return {"fv": 0, "pv_10y": 0, "pv_terminal": 0, "error": True}
     
     try:
-        # Vereinfachte Gordon Growth Model
-        if wacc <= growth_rate:
-            # Fallback wenn Wachstum >= WACC (unrealistisch)
-            fv = fcf_per_share * 15  # Einfacher Multiplikator
+        if WACC <= growth_rate:
+            fv = fcf_per_share * 15
             return {"fv": fv, "pv_10y": fv * 0.7, "pv_terminal": fv * 0.3, "method": "Fallback"}
         
-        # DCF 10-Jahres Projection
         pv_10y = 0
-        fcf_current = fcf_per_share
-        
         for year in range(1, 11):
             fcf_projected = fcf_per_share * ((1 + growth_rate) ** year)
-            pv = fcf_projected / ((1 + wacc) ** year)
+            pv = fcf_projected / ((1 + WACC) ** year)
             pv_10y += pv
         
-        # Terminal Value (Gordon Growth nach Jahr 10)
         fcf_year10 = fcf_per_share * ((1 + growth_rate) ** 10)
-        terminal_value = (fcf_year10 * (1 + terminal_growth)) / (wacc - terminal_growth)
-        pv_terminal = terminal_value / ((1 + wacc) ** 10)
+        terminal_value = (fcf_year10 * (1 + TERMINAL_GROWTH)) / (WACC - TERMINAL_GROWTH)
+        pv_terminal = terminal_value / ((1 + WACC) ** 10)
         
-        # Fair Value = Sum PV 10 Jahre + PV Terminal Value
         fv = pv_10y + pv_terminal
         
         return {
@@ -128,23 +100,18 @@ def calculate_dcf_fair_value(fcf_per_share: float, growth_rate: float = 0.10, wa
             "pv_10y": pv_10y,
             "pv_terminal": pv_terminal,
             "fcf_year10": fcf_year10,
-            "terminal_value": terminal_value,
-            "error": False,
-            "method": "DCF 10-Year + Terminal"
+            "error": False
         }
-    
     except Exception as e:
         return {"fv": 0, "error": True, "error_msg": str(e)}
 
 def calculate_avg_drawdown(hist: pd.DataFrame) -> float:
-    """Berechne durchschnittlichen Drawdown"""
     running_max = hist['Close'].cummax()
     drawdown = (hist['Close'] - running_max) / running_max
     significant_drawdowns = drawdown[drawdown < DRAWDOWN_THRESHOLD]
     return significant_drawdowns.mean() * 100 if not significant_drawdowns.empty else 0.0
 
 def calculate_technical_metrics(hist: pd.DataFrame, price_usd: float) -> dict:
-    """Berechne technische Metriken"""
     metrics = {}
     metrics['rsi'] = ta.rsi(hist['Close'], length=RSI_LENGTH).iloc[-1]
     
@@ -172,7 +139,6 @@ def calculate_technical_metrics(hist: pd.DataFrame, price_usd: float) -> dict:
     return metrics
 
 def generate_signal(price_eur: float, fv_eur: float, rsi: float, mos_pct: float) -> tuple[str, int]:
-    """Generiere Kauf-Signal"""
     buy_limit = fv_eur * (1 - mos_pct)
     watch_limit = fv_eur * (1 + mos_pct)
     
@@ -183,11 +149,9 @@ def generate_signal(price_eur: float, fv_eur: float, rsi: float, mos_pct: float)
     else:
         return "🔴 WARTEN", 3
 
-# --- 4. HAUPTPROGRAMM ---
 db = init_db()
 st.title("💎 Equity Intelligence: DCF Fair Value (Buffett-Style)")
 
-# --- SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ DCF Parameter")
     
@@ -261,7 +225,6 @@ try:
 
         hist, info = market_data_map[t]
         
-        # --- DCF BERECHNUNG ---
         fcf_per_share = calculate_fcf_per_share(info)
         dcf_result = calculate_dcf_fair_value(fcf_per_share, growth_rate=growth_rate)
         
@@ -269,7 +232,7 @@ try:
         fv_usd = dcf_result.get('fv', 0)
         
         if fv_usd <= 0:
-            continue  # Überspringe wenn keine gültigen Daten
+            continue
         
         fv_eur = fv_usd / eur_usd
         price_eur = price_usd / eur_usd
@@ -281,9 +244,9 @@ try:
 
         all_results.append({
             "Ticker": t,
-            "Kurs (€)": price_eur,
-            "Fair Value (€)": fv_eur,
-            "Upside (%)": upside,
+            "Kurs_EUR": price_eur,
+            "Fair_Value_EUR": fv_eur,
+            "Upside_PCT": upside,
             "RSI": rsi_now,
             "Signal": signal,
             "_price_usd": price_usd,
@@ -291,7 +254,6 @@ try:
             "_fcf_per_share": fcf_per_share,
             "_pv_10y": dcf_result.get('pv_10y', 0),
             "_pv_terminal": dcf_result.get('pv_terminal', 0),
-            "_fcf_year10": dcf_result.get('fcf_year10', 0),
             "_corr_ath": tech_metrics['corr_ath'],
             "_avg_dd": tech_metrics['avg_dd'],
             "_trend": tech_metrics['trend'],
@@ -301,7 +263,7 @@ try:
         })
 
     if all_results:
-        df = pd.DataFrame(all_results).sort_values(["_rank", "Upside (%)"], ascending=[True, False])
+        df = pd.DataFrame(all_results).sort_values(["_rank", "Upside_PCT"], ascending=[True, False])
 
         def highlight_rows(row):
             if "🟢" in row['Signal']:
@@ -314,9 +276,9 @@ try:
 
         st.subheader("📊 Markt-Ranking")
         st.dataframe(
-            df[["Ticker", "Kurs (€)", "Fair Value (€)", "Upside (%)", "RSI", "Signal"]]
+            df[["Ticker", "Kurs_EUR", "Fair_Value_EUR", "Upside_PCT", "RSI", "Signal"]]
             .style.apply(highlight_rows, axis=1)
-            .format({"Kurs (€)": "{:.2f}", "Fair Value (€)": "{:.2f}", "Upside (%)": "{:.1f}", "RSI": "{:.1f}"}),
+            .format({"Kurs_EUR": "{:.2f}", "Fair_Value_EUR": "{:.2f}", "Upside_PCT": "{:.1f}", "RSI": "{:.1f}"}),
             use_container_width=True,
             hide_index=True
         )
@@ -326,54 +288,50 @@ try:
         st.subheader("🔬 DCF-Tiefenanalyse")
         selected = st.selectbox("Ticker auswählen", df['Ticker'].values)
         
-       # --- Ersetze diesen kompletten Abschnitt ---
-if selected:
-    row = df[df['Ticker'] == selected].iloc[0]
-    hist, info = market_data_map[selected]
+        if selected:
+            row = df[df['Ticker'] == selected].iloc[0]
+            hist, info = market_data_map[selected]
 
-    st.subheader(f"DCF Fair Value Analyse: {selected}")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("FCF/Share", f"${row['_fcf_per_share']:.2f}")
-    col2.metric("PV (10 Jahre)", f"${row['_pv_10y']:.2f}")
-    col3.metric("PV Terminal", f"${row['_pv_terminal']:.2f}")
-    col4.metric("Fair Value", f"${row['_fv_usd']:.2f}")
-    
-    # FIX: Variablen extrahieren für f-string
-    fcf_share = row['_fcf_per_share']
-    fv_usd = row['_fv_usd']
-    fv_eur = row['Fair Value (€)']
-    kurs_eur = row['Kurs (€)']
-    upside_pct = row['Upside (%)']
-    signal = row['Signal']
-    
-    st.markdown(f"""
-    **DCF-Berechnung (Buffett-Style):**
-    
-    **Annahmen:**
-    - Free Cash Flow pro Share: **${fcf_share:.2f}**
-    - Wachstum 10 Jahre: **{growth_rate*100:.0f}%**
-    - WACC (Discount Rate): **{WACC*100:.2f}%**
-    - Terminal Growth: **{TERMINAL_GROWTH*100:.1f}%**
-    
-    **Bewertung:**
-    - PV (Cash Flows Jahre 1-10): **${row['_pv_10y']:.2f}**
-    - PV (Terminal Value): **${row['_pv_terminal']:.2f}**
-    
-    **Fair Value Gesamt: ${fv_usd:.2f} ≈ €{fv_eur:.2f}**
-    
-    **Einschätzung:**
-    - Aktueller Kurs: **€{kurs_eur:.2f}**
-    - Upside: **{upside_pct:.1f}%**
-    - Signal: **{signal}**
-    """)
-
+            st.subheader(f"DCF Fair Value Analyse: {selected}")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("FCF/Share", f"${row['_fcf_per_share']:.2f}")
+            col2.metric("PV (10 Jahre)", f"${row['_pv_10y']:.2f}")
+            col3.metric("PV Terminal", f"${row['_pv_terminal']:.2f}")
+            col4.metric("Fair Value", f"${row['_fv_usd']:.2f}")
+            
+            fcf_val = row['_fcf_per_share']
+            fv_usd_val = row['_fv_usd']
+            fv_eur_val = row['Fair_Value_EUR']
+            kurs_eur_val = row['Kurs_EUR']
+            upside_val = row['Upside_PCT']
+            
+            st.markdown(f"""
+            **DCF-Berechnung (Buffett-Style):**
+            
+            **Annahmen:**
+            - Free Cash Flow pro Share: **${fcf_val:.2f}**
+            - Wachstum 10 Jahre: **{growth_rate*100:.0f}%**
+            - WACC (Discount Rate): **{WACC*100:.2f}%**
+            - Terminal Growth: **{TERMINAL_GROWTH*100:.1f}%**
+            
+            **Bewertung:**
+            - PV (Cash Flows Jahre 1-10): **${row['_pv_10y']:.2f}**
+            - PV (Terminal Value): **${row['_pv_terminal']:.2f}**
+            
+            **Fair Value Gesamt: ${fv_usd_val:.2f} ≈ €{fv_eur_val:.2f}**
+            
+            **Einschätzung:**
+            - Aktueller Kurs: **€{kurs_eur_val:.2f}**
+            - Upside: **{upside_val:.1f}%**
+            - Signal: **{row['Signal']}**
+            """)
 
             st.divider()
 
             col1, col2, col3, col4, col5 = st.columns(5)
-            col1.metric("Kurs", f"{row['_price_usd']:.2f} $", delta=f"≈ {row['Kurs (€)']:.2f} €", delta_color="off")
-            col2.metric("Fair Value", f"{row['_fv_usd']:.2f} $", delta=f"≈ {row['Fair Value (€)']:.2f} €", delta_color="off")
+            col1.metric("Kurs", f"{row['_price_usd']:.2f} $", delta=f"≈ {row['Kurs_EUR']:.2f} EUR", delta_color="off")
+            col2.metric("Fair Value", f"{row['_fv_usd']:.2f} $", delta=f"≈ {row['Fair_Value_EUR']:.2f} EUR", delta_color="off")
             col3.metric("RSI (14)", f"{row['RSI']:.1f}", delta="Buy Zone" if row['RSI'] < 40 else "Neutral", delta_color="inverse")
             col4.metric("Korrektur", f"{row['_corr_ath']:.1f}%", delta=f"Avg: {row['_avg_dd']:.1f}%", delta_color="off")
             col5.metric("Trend", f"{row['_trend']}", delta=f"{row['_vol']}")
@@ -387,10 +345,10 @@ if selected:
             )
             
             hist_eur = hist['Close'] / eur_usd
-            fv_eur = row['Fair Value (€)']
+            fv_eur = row['Fair_Value_EUR']
             
             fig.add_trace(
-                go.Scatter(x=hist.index, y=hist_eur, name="Kurs (€)", 
+                go.Scatter(x=hist.index, y=hist_eur, name="Kurs (EUR)", 
                           line=dict(color='#58a6ff', width=2)),
                 row=1, col=1
             )
@@ -438,7 +396,7 @@ if selected:
                 title=f"DCF Chartanalyse: {selected} (Growth {growth_rate*100:.0f}%)",
                 xaxis_rangeslider_visible=False
             )
-            fig.update_yaxes(title_text="Preis (€)", row=1, col=1)
+            fig.update_yaxes(title_text="Preis (EUR)", row=1, col=1)
             fig.update_yaxes(title_text="RSI", row=2, col=1)
             
             st.plotly_chart(fig, use_container_width=True)
