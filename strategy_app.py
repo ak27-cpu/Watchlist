@@ -5,26 +5,24 @@ import pandas_ta as ta
 import plotly.graph_objects as go
 from supabase import create_client, Client
 
-# --- BASIS KONFIGURATION ---
-st.set_page_config(page_title="Stock Strategy Analysis", layout="wide")
-
-# Supabase Initialisierung
-@st.cache_resource
-def init_supabase():
-    try:
-    supabase = create_client(st.secrets["supabase"]["url"], st.secrets["supabase"]["key"])
-except Exception as e:
-    st.error(f"Datenbank-Fehler: {e}")
+# --- 1. SUPABASE INITIALISIERUNG ---
+# Wir verzichten auf Caching, um Secret-Fehler auszuschließen
+if "SUPABASE_URL" in st.secrets and "SUPABASE_KEY" in st.secrets:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_KEY"]
+    supabase: Client = create_client(url, key)
+else:
+    st.error("❌ Kritischer Fehler: Secrets 'SUPABASE_URL' oder 'SUPABASE_KEY' nicht gefunden.")
+    st.info("Obwohl eine andere App funktioniert, prüfe bitte, ob diese spezifische App in den Streamlit-Cloud-Settings die Secrets hinterlegt hat.")
     st.stop()
 
-supabase = init_supabase()
-
-# --- FUNKTIONEN ---
+# --- 2. HILFSFUNKTIONEN FÜR DATEN ---
 
 def get_eur_usd():
     """Holt aktuellen EUR/USD Kurs."""
     try:
-        return yf.download("EURUSD=X", period="1d", interval="1m", progress=False)['Close'].iloc[-1]
+        data = yf.download("EURUSD=X", period="1d", interval="1m", progress=False)
+        return data['Close'].iloc[-1]
     except:
         return 1.05
 
@@ -37,27 +35,27 @@ def get_data(ticker, eur_usd):
         info = tk.info
         hist_60d = hist.tail(60).copy()
         
-        # 1. EPS 2026 Kalkulation
+        # Fair Value Kalkulation (Prompt-Logik)
         fwd_eps = info.get('forwardEps') or info.get('trailingEps') or 1.0
         growth = info.get('earningsGrowth', 0.1) 
         eps_2026 = fwd_eps * (1 + growth)**2
         
-        # 2. KGV Spanne (10J Median Proxy)
         kgv_median = info.get('forwardPE') or info.get('trailingPE') or 20
         unteres_kgv = kgv_median * 0.8
         
-        # 3. Fair Value (USD)
         fv_usd = (eps_2026 * unteres_kgv + eps_2026 * kgv_median) / 2
         price_usd = info.get('currentPrice') or hist['Close'].iloc[-1]
         
-        # 4. Umrechnungen & Tranchen
+        # Umrechnungen
         price_eur = price_usd / eur_usd
         fv_eur = fv_usd / eur_usd
+        
+        # ATH & Tranchen
         ath_usd = hist['High'].max()
         ath_eur = ath_usd / eur_usd
         corr_ath = ((price_usd - ath_usd) / ath_usd) * 100
         
-        # 5. Indikatoren (RSI, ADX, Volumen)
+        # Indikatoren
         rsi = ta.rsi(hist_60d['Close'], length=14).iloc[-1]
         adx = ta.adx(hist_60d['High'], hist_60d['Low'], hist_60d['Close'])['ADX_14'].iloc[-1]
         
@@ -65,7 +63,7 @@ def get_data(ticker, eur_usd):
         vol_ma = hist_60d['Volume'].mean()
         vol_sig = "Buy" if vol_now > (vol_ma * 1.5) else "Sell" if vol_now < (vol_ma * 0.8) else "Hold"
         
-        # 6. Bewertung mit Sortier-Index
+        # Bewertung & Ranking
         upside = ((fv_usd - price_usd) / price_usd) * 100
         if upside > 10 and rsi < 40 and vol_sig == "Buy":
             bewertung, sort_idx = "🟢 KAUF", 1
@@ -84,7 +82,7 @@ def get_data(ticker, eur_usd):
             "Tranche1(-10%)": round(float(ath_eur * 0.9), 2),
             "Tranche2(-20%)": round(float(ath_eur * 0.8), 2),
             "RSI": round(float(rsi), 1),
-            "vs ATH": f"{round(float(corr_ath), 1)}%",
+            "Korrektur": f"{round(float(corr_ath), 1)}%",
             "Trend": "Stark" if adx > 25 else "Mittel" if adx > 20 else "Schwach",
             "Volumen": vol_sig,
             "_sort": sort_idx
@@ -92,54 +90,47 @@ def get_data(ticker, eur_usd):
     except:
         return None
 
-# --- UI ---
-st.title("🚀 Smart Analysis: Watchlist Strategie")
+# --- 3. UI ---
 
-if supabase:
-    try:
-        # Ticker aus der Tabelle 'watchlist' laden
-        response = supabase.from_("watchlist").select("ticker").execute()
-        ticker_list = [t['ticker'].strip() for t in response.data]
-        
-        if not ticker_list:
-            st.warning("⚠️ Tabelle 'watchlist' ist leer. Füge Ticker in der Sidebar hinzu!")
-            st.stop()
-            
+st.title("📈 Stock Strategy Analysis Pro")
+
+# Ticker aus Supabase laden
+try:
+    # Wir laden aus der Tabelle 'watchlist'
+    response = supabase.from_("watchlist").select("ticker").execute()
+    ticker_list = [t['ticker'].strip().upper() for t in response.data]
+    
+    if not ticker_list:
+        st.warning("⚠️ Tabelle 'watchlist' ist leer. Bitte Ticker hinzufügen.")
+    else:
         eur_usd = get_eur_usd()
         st.write(f"Wechselkurs: **1 EUR = {round(eur_usd, 4)} USD**")
         
         results = []
-        with st.spinner('Marktdaten werden geladen...'):
+        with st.spinner('Analysiere Aktien...'):
             for t in ticker_list:
                 res = get_data(t, eur_usd)
                 if res: results.append(res)
         
         if results:
-            # In DataFrame umwandeln und sortieren
             df = pd.DataFrame(results)
+            # Sortierung: KAUF oben, dann nach Upside
             df = df.sort_values(by=["_sort", "Upside(%)"], ascending=[True, False])
             
-            # Anzeige-Spalten (ohne Sortier-Hilfe)
-            display_df = df.drop(columns=["_sort"])
-            
-            # 1. Tabelle mit Styling
-            st.subheader("Analyse & Ranking")
-            
-            def color_rating(val):
-                if "🟢" in str(val): return 'background-color: #d4edda'
-                if "🟡" in str(val): return 'background-color: #fff3cd'
-                if "🔴" in str(val): return 'background-color: #f8d7da'
-                return ''
-
+            # Anzeige
+            st.subheader("Marktanalyse & Ranking")
             st.dataframe(
-                display_df.style.applymap(color_rating, subset=['Bewertung']),
-                use_container_width=True, 
-                hide_index=True
+                df.drop(columns=["_sort"]).style.applymap(
+                    lambda x: 'background-color: #d4edda' if "🟢" in str(x) else 
+                              ('background-color: #fff3cd' if "🟡" in str(x) else 
+                               ('background-color: #f8d7da' if "🔴" in str(x) else '')),
+                    subset=['Bewertung']
+                ),
+                use_container_width=True, hide_index=True
             )
             
-            # 2. Charts
+            # Grafische Gauge Charts
             st.divider()
-            st.subheader("Grafischer Fair Value Check")
             cols = st.columns(3)
             for i, (idx, row) in enumerate(df.iterrows()):
                 with cols[i % 3]:
@@ -148,7 +139,7 @@ if supabase:
                         value = row['Kurs(€)'],
                         title = {'text': f"{row['Ticker']} ({row['Bewertung']})"},
                         gauge = {
-                            'axis': {'range': [0, max(row['Fair Value(€)'], row['Kurs(€)']) * 1.5]},
+                            'axis': {'range': [0, max(row['Fair Value(€)'], row['Kurs(€)']) * 1.3]},
                             'steps': [
                                 {'range': [0, row['Fair Value(€)']], 'color': "#E8F5E9"},
                                 {'range': [row['Fair Value(€)'], 9999], 'color': "#FFEBEE"}
@@ -159,19 +150,18 @@ if supabase:
                     fig.update_layout(height=230, margin=dict(l=15,r=15,t=45,b=15))
                     st.plotly_chart(fig, use_container_width=True)
 
-    except Exception as e:
-        st.error(f"Fehler: {e}")
+except Exception as e:
+    st.error(f"⚠️ Fehler beim Zugriff auf die Tabelle 'watchlist': {e}")
 
-# Sidebar Administration
+# Sidebar für Admin-Funktionen
 with st.sidebar:
-    st.header("Watchlist Verwaltung")
-    new_ticker = st.text_input("Ticker-Kürzel (z.B. MSFT)").upper()
-    if st.button("Hinzufügen"):
-        if new_ticker:
-            supabase.table("watchlist").insert({"ticker": new_ticker}).execute()
-            st.success(f"{new_ticker} gespeichert!")
+    st.header("Verwaltung")
+    new_t = st.text_input("Ticker hinzufügen").upper()
+    if st.button("Speichern"):
+        if new_t:
+            supabase.table("watchlist").insert({"ticker": new_t}).execute()
+            st.success(f"{new_t} hinzugefügt!")
             st.rerun()
     
-    st.divider()
-    if st.button("🔄 Ansicht aktualisieren"):
+    if st.button("🔄 Alles aktualisieren"):
         st.rerun()
