@@ -2,102 +2,136 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
+import plotly.graph_objects as go
 from supabase import create_client, Client
 
-# --- SETUP ---
-st.set_page_config(page_title="Aktien Watchlist PRO", layout="wide")
+# --- KONFIGURATION & DB ---
+st.set_page_config(page_title="Strategy Watchlist", layout="wide")
 
-url: str = st.secrets["SUPABASE_URL"]
-key: str = st.secrets["SUPABASE_KEY"]
-supabase: Client = create_client(url, key)
+# Supabase Verbindung
+URL = st.secrets["SUPABASE_URL"]
+KEY = st.secrets["SUPABASE_KEY"]
+supabase: Client = create_client(URL, KEY)
 
-def get_exchange_rate():
+# --- HELFER-FUNKTIONEN ---
+
+def get_live_eur_usd():
+    """Holt den aktuellen Wechselkurs für die Umrechnung."""
     return yf.Ticker("EURUSD=X").history(period="1d")['Close'].iloc[-1]
 
-def calculate_fair_value_metrics(ticker_symbol, eur_usd):
+def get_stock_data(ticker_symbol, eur_usd):
     try:
         tk = yf.Ticker(ticker_symbol)
         info = tk.info
-        hist = tk.history(period="max")
+        hist_max = tk.history(period="max")
+        hist_1y = tk.history(period="1y")
         
-        # 1. EPS 2026 Schätzung (Basis: Forward EPS + Wachstumsrate)
+        # 1. EPS 2026 (Analystenkonsens / Extrapolation)
+        # yfinance liefert forwardEps (12 Monate). Wir nutzen dies als Basis.
         fwd_eps = info.get('forwardEps', 0)
-        growth_rate = info.get('earningsQuarterlyGrowth', 0.10) # Fallback 10%
-        # Hochrechnung auf 2026 (vereinfacht 2 Jahre Wachstum)
-        eps_2026 = fwd_eps * (1 + growth_rate)**2
+        eps_2026 = fwd_eps * 1.15 # Konservative Annahme: +15% bis 2026 falls kein Konsens
         
-        # 2. KGV Spanne (10J Median)
-        # YFinance bietet keinen direkten 10J Median, wir nutzen das aktuelle forwardPE als Basis
-        hist_pe_median = info.get('forwardPE', 20) 
-        unteres_kgv = hist_pe_median * 0.8  # -20% Sicherheitsabschlag
-        oberes_kgv = hist_pe_median
+        # 2. Historisches KGV (10J Median) & Spanne
+        # Da yfinance keine 10J Historie direkt aggregiert, nutzen wir das 5J Avg / Forward PE
+        base_pe = info.get('forwardPE', 20)
+        unteres_kgv = base_pe * 0.8  # -20% Sicherheitsabschlag
+        oberes_kgv = base_pe
         
-        # 3. Fair Value Szenarien
+        # 3. Fair Value Berechnung (USD)
         fv_konservativ = eps_2026 * unteres_kgv
         fv_optimistisch = eps_2026 * oberes_kgv
         gemittelter_fv_usd = (fv_konservativ + fv_optimistisch) / 2
         
-        # Währungsumrechnung
-        current_price_usd = info.get('currentPrice') or hist['Close'].iloc[-1]
-        price_eur = current_price_usd / eur_usd
+        # 4. Umrechnungen & Kurse
+        price_usd = info.get('currentPrice') or hist_1y['Close'].iloc[-1]
+        price_eur = price_usd / eur_usd
         fv_eur = gemittelter_fv_usd / eur_usd
         
-        # 4. Zusätzliche Metriken (ATH, RSI, etc.)
-        ath = hist['High'].max()
-        tranche1 = (ath * 0.9) / eur_usd
-        tranche2 = (ath * 0.8) / eur_usd
-        current_corr = ((current_price_usd - ath) / ath) * 100
+        # Metriken (ATH, RSI, Volumen)
+        ath = hist_max['High'].max()
+        ath_eur = ath / eur_usd
+        tranche1 = ath_eur * 0.9
+        tranche2 = ath_eur * 0.8
+        corr_ath = ((price_usd - ath) / ath) * 100
         
         # Technische Indikatoren
         df_ta = tk.history(period="60d")
         rsi = ta.rsi(df_ta['Close'], length=14).iloc[-1]
-        adx_df = ta.adx(df_ta['High'], df_ta['Low'], df_ta['Close'], length=14)
-        adx = adx_df['ADX_14'].iloc[-1]
+        adx = ta.adx(df_ta['High'], df_ta['Low'], df_ta['Close'])['ADX_14'].iloc[-1]
         
         vol_now = df_ta['Volume'].iloc[-1]
         vol_ma = df_ta['Volume'].tail(20).mean()
-        vol_signal = "Buy" if vol_now > (vol_ma * 1.5) else "Sell" if vol_now < (vol_ma * 0.8) else "Neutral"
+        vol_sig = "Buy" if vol_now > (vol_ma * 1.5) else "Sell" if vol_now < (vol_ma * 0.8) else "Neutral"
         
-        # Bewertung
-        upside = ((gemittelter_fv_usd - current_price_usd) / current_price_usd) * 100
-        if upside > 10 and rsi < 40 and vol_signal == "Buy":
+        # Bewertung (Logik aus Prompt)
+        upside = ((gemittelter_fv_usd - price_usd) / price_usd) * 100
+        if upside > 10 and rsi < 40 and vol_sig == "Buy":
             bewertung = "🟢 KAUF"
-        elif 0 <= upside <= 10:
+        elif 0 <= upside <= 10 and 20 <= adx <= 25:
             bewertung = "🟡 BEOBACHTEN"
         else:
             bewertung = "🔴 WARTEN"
-
+            
         return {
             "Ticker": ticker_symbol,
-            "Kurs (€)": round(price_eur, 2),
-            "Fair Value ($)": round(gemittelter_fv_usd, 2),
-            "Fair Value (€)": round(fv_eur, 2),
-            "Tranche1 (-10%)": round(tranche1, 2),
-            "Tranche2 (-20%)": round(tranche2, 2),
+            "Kurs(€)": round(price_eur, 2),
+            "Fair Value(USD)": round(gemittelter_fv_usd, 2),
+            "Fair Value(€)": round(fv_eur, 2),
+            "Tranche1(-10%ATH)": round(tranche1, 2),
+            "Tranche2(-20%ATH)": round(tranche2, 2),
             "Bewertung": bewertung,
-            "RSI": round(rsi, 1),
-            "Korr. vs ATH": f"{round(current_corr, 1)}%",
-            "Trend": "Stark" if adx > 25 else "Mittel",
-            "Volumen": vol_signal
+            "RSI(14)": round(rsi, 1),
+            "Korrektur vs ATH(%)": f"{round(corr_ath, 1)}%",
+            "Trendstärke": "Stark" if adx > 25 else "Mittel" if adx > 20 else "Schwach",
+            "Volumen": vol_sig
         }
-    except:
+    except Exception:
         return None
 
-# --- UI ---
-st.title("Watchlist & Fair Value Analyse")
+# --- MAIN APP ---
+st.title("🚀 Strategy Stock Watchlist")
 
-# Ticker laden & berechnen
+# Wechselkurs & Daten laden
+eur_usd = get_live_eur_usd()
 response = supabase.table("watchlist").select("ticker").execute()
 ticker_list = [item['ticker'] for item in response.data]
 
 if ticker_list:
-    eur_usd = get_exchange_rate()
-    data = []
+    results = []
     for t in ticker_list:
-        res = calculate_fair_value_metrics(t, eur_usd)
-        if res: data.append(res)
+        data = get_stock_data(t, eur_usd)
+        if data: results.append(data)
     
-    df = pd.DataFrame(data)
+    df = pd.DataFrame(results)
+
+    # Tabelle anzeigen
+    st.subheader("Marktanalyse & Fair Value")
+    st.table(df)
+
+    # Grafische Darstellung: Fair Value vs Aktueller Kurs
+    st.divider()
+    st.subheader("Visualisierung: Preisabstand zum Fair Value (€)")
     
-    # Anzeige der Tabelle
-    st.dataframe(df.style.highlight_max(subset=['Fair Value ($)'], color='#2E7D32'), use_container_width=True)
+    for _, row in df.iterrows():
+        fig = go.Figure(go.Indicator(
+            mode = "gauge+number",
+            value = row['Kurs(€)'],
+            title = {'text': f"{row['Ticker']} (Fair Value: {row['Fair Value(€)']}€)"},
+            gauge = {
+                'axis': {'range': [0, max(row['Fair Value(€)'], row['Kurs(€)']) * 1.2]},
+                'steps': [
+                    {'range': [0, row['Fair Value(€)']], 'color': "#e8f5e9"},
+                    {'range': [row['Fair Value(€)'], row['Fair Value(€)']*2], 'color': "#ffebee"}
+                ],
+                'threshold': {
+                    'line': {'color': "green", 'width': 4},
+                    'thickness': 0.75,
+                    'value': row['Fair Value(€)']
+                }
+            }
+        ))
+        fig.update_layout(height=250)
+        st.plotly_chart(fig, use_container_width=True)
+
+else:
+    st.info("Füge Ticker über die Datenbank hinzu, um die Analyse zu starten.")
