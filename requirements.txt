@@ -5,3 +5,4 @@ supabase
 numpy
 pandas_ta
 python-dotenv
+plotly.graph_objects
