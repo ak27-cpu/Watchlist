@@ -1,10 +1,37 @@
 import streamlit as st
 import yfinance as yf
-import pandas as pd
-import pandas_ta as ta
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from supabase import create_client, Client
+from requests import Session
+from requests_cache import CacheControl
+from retry_requests import retry
+
+# --- NEU: Robustere Abfrage-Session ---
+@st.cache_resource
+def get_robust_session():
+    # Erstellt eine Session, die sich wie ein Browser verhält und bei Fehlern wiederholt
+    session = Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    })
+    # Automatische Wiederholung bei Timeout oder Verbindungsfehlern
+    retried_session = retry(session, retries=3, backoff_factor=0.2)
+    return retried_session
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_market_data(ticker):
+    session = get_robust_session()
+    try:
+        # Wir übergeben die session direkt an yfinance
+        tk = yf.Ticker(ticker, session=session)
+        hist = tk.history(period="max") 
+        if hist.empty:
+            # Plan B: Falls 'max' fehlschlägt, versuche 2 Jahre
+            hist = tk.history(period="2y")
+        
+        if hist.empty: return None
+        return hist, tk.info
+    except Exception as e:
+        print(f"Fehler bei {ticker}: {e}")
+        return None
 
 # --- 1. SETUP & STYLE ---
 st.set_page_config(page_title="Equity Intelligence Pro", layout="wide")
