@@ -1,8 +1,7 @@
-streamlit
-pandas
-yfinance
+pip install 
+streamlit 
+yfinance 
+pandas 
+pandas-ta 
+plotly 
 supabase
-numpy
-pandas_ta
-python-dotenv
-plotly.graph_objects
