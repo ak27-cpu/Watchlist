@@ -5,143 +5,99 @@ import pandas_ta as ta
 import plotly.graph_objects as go
 from supabase import create_client, Client
 
-# --- PAGE CONFIG ---
-st.set_page_config(page_title="Equity Intelligence Dashboard", layout="wide", initial_sidebar_state="collapsed")
+# --- SETUP & STYLING ---
+st.set_page_config(page_title="Equity Intelligence", layout="wide")
 
-# Custom CSS für einen moderneren Look
+# Dunkles Design & Abstände
 st.markdown("""
     <style>
-    .main { background-color: #0e1117; }
     .stMetric { background-color: #1e2130; padding: 15px; border-radius: 10px; border: 1px solid #30363d; }
-    [data-testid="stHeader"] { background: rgba(0,0,0,0); }
+    .main { background-color: #0e1117; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- DB & DATA LOGIC ---
+# --- DATEN LOGIK ---
 @st.cache_resource
 def init_db():
     return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
-def get_stock_metrics(ticker, eur_usd):
+def fetch_data(ticker):
     try:
         tk = yf.Ticker(ticker)
-        hist = tk.history(period="1y") # 1 Jahr für Mini-Charts
+        hist = tk.history(period="1y")
         if hist.empty: return None
-        
         info = tk.info
-        price_usd = info.get('currentPrice') or hist['Close'].iloc[-1]
-        fwd_eps = info.get('forwardEps') or info.get('trailingEps') or 1.0
-        growth = info.get('earningsGrowth') or 0.10
-        kgv_median = info.get('forwardPE') or 20
-        
-        # KGV Methode
-        eps_2026 = fwd_eps * (1 + growth)**2
-        fv_kgv = eps_2026 * kgv_median
-        
-        # DDM Methode
-        div_rate = info.get('dividendRate') or 0
-        g = min(growth, 0.07)
-        k = 0.09
-        fv_ddm = (div_rate * (1 + g)) / (k - g) if div_rate > 0 and k > g else 0
-
-        # Kombinierter Fair Value
-        fv_final_usd = (fv_kgv + fv_ddm) / 2 if fv_ddm > 0 else fv_kgv
-        
-        price_eur = price_usd / eur_usd
-        fv_eur = fv_final_usd / eur_usd
-        upside = ((fv_final_usd - price_usd) / price_usd) * 100
-        rsi = ta.rsi(hist['Close'], length=14).iloc[-1]
-
-        # Ranking
-        rank = 1 if upside > 15 and rsi < 45 else (2 if upside > 0 else 3)
-        bewertung = "🟢 STRONG BUY" if rank == 1 else ("🟡 WATCH" if rank == 2 else "🔴 OVERVALUED")
-
-        return {
-            "Ticker": ticker,
-            "Signal": bewertung,
-            "Price (€)": round(price_eur, 2),
-            "Fair Value (€)": round(fv_eur, 2),
-            "Upside (%)": round(upside, 1),
-            "RSI": round(rsi, 1),
-            "Trend (1Y)": hist['Close'].tolist(), # Für Mini-Chart
-            "_rank": rank
-        }
+        return tk, hist, info
     except: return None
 
-# --- MAIN INTERFACE ---
+# --- APP START ---
 db = init_db()
-st.title("💎 Equity Intelligence")
-st.caption("Multi-Model Valuation Dashboard (KGV + DDM)")
+st.title("💎 Equity Intelligence Dashboard")
 
 try:
+    # 1. Ticker & FX laden
     res = db.table("watchlist").select("ticker").execute()
     tickers = [t['ticker'].upper() for t in res.data]
+    
+    eur_usd_data = yf.download("EURUSD=X", period="1d", progress=False)
+    eur_usd = float(eur_usd_data['Close'].iloc[-1])
 
     if tickers:
-        # Header Metriken
-        eur_usd = yf.download("EURUSD=X", period="1d", progress=False)['Close'].iloc[-1]
+        # 2. Haupt-Tabelle berechnen
+        all_results = []
+        with st.spinner('Analysiere Portfolio...'):
+            for t in tickers:
+                bundle = fetch_data(t)
+                if not bundle: continue
+                tk, hist, info = bundle
+                
+                # Fair Value Logik (KGV + DDM Schnitt)
+                fwd_eps = info.get('forwardEps') or info.get('trailingEps') or 1.0
+                growth = info.get('earningsGrowth') or 0.1
+                kgv = info.get('forwardPE') or 20
+                fv_kgv = (fwd_eps * (1+growth)**2) * kgv
+                
+                price_eur = (info.get('currentPrice') or hist['Close'].iloc[-1]) / eur_usd
+                fv_eur = fv_kgv / eur_usd
+                upside = ((fv_eur - price_eur) / price_eur) * 100
+                
+                all_results.append({
+                    "Ticker": t,
+                    "Preis (€)": round(price_eur, 2),
+                    "Fair Value (€)": round(fv_eur, 2),
+                    "Upside (%)": round(upside, 1),
+                    "RSI": round(ta.rsi(hist['Close'], length=14).iloc[-1], 1),
+                    "Status": "🟢 KAUF" if upside > 15 else ("🟡 HALTEN" if upside > 0 else "🔴 TEUER")
+                })
+
+        df = pd.DataFrame(all_results).sort_values("Upside (%)", ascending=False)
         
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Currency", "EUR/USD", round(eur_usd, 4))
-        m2.metric("Watchlist Size", f"{len(tickers)} Stocks")
-        m3.metric("Top Signal", f"{tickers[0]}") # Platzhalter für echte Logik
+        # 3. UI: Übersicht
+        st.subheader("Markt-Übersicht")
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
+        # 4. UI: Detail-Analyse
         st.divider()
+        selected = st.selectbox("🔬 Wähle einen Ticker für Details", tickers)
+        
+        if selected:
+            tk, hist, info = fetch_data(selected)
+            col1, col2 = st.columns([1, 2])
+            
+            with col1:
+                st.metric("Aktueller Kurs", f"{round(df.loc[df['Ticker']==selected, 'Preis (€)'].values[0], 2)} €")
+                st.metric("Fair Value", f"{round(df.loc[df['Ticker']==selected, 'Fair Value (€)'].values[0], 2)} €")
+                st.write(f"**Sektor:** {info.get('sector', 'N/A')}")
+                st.write(f"**Dividende:** {info.get('dividendYield', 0)*100:.2f} %")
 
-        # Daten laden
-        with st.spinner('Calculating Fair Values...'):
-            data = [get_stock_metrics(t, eur_usd) for t in tickers]
-            df = pd.DataFrame([d for d in data if d]).sort_values("_rank")
-
-        # Hochwertige Tabelle
-        st.subheader("Market Opportunities")
-        st.dataframe(
-            df.drop(columns=["_rank"]),
-            column_config={
-                "Ticker": st.column_config.TextColumn("Asset", help="Ticker Symbol", width="small"),
-                "Upside (%)": st.column_config.ProgressColumn("Upside Pot.", format="%f%%", min_value=-50, max_value=50),
-                "Trend (1Y)": st.column_config.LineChartColumn("1Y Price Trend"),
-                "Price (€)": st.column_config.NumberColumn(format="€ %.2f"),
-                "Fair Value (€)": st.column_config.NumberColumn(format="€ %.2f"),
-                "RSI": st.column_config.NumberColumn(format="%.1f")
-            },
-            hide_index=True,
-            use_container_width=True
-        )
-
-        # Gauge Charts in einem Grid
-        st.divider()
-        st.subheader("Valuation Gauges")
-        cols = st.columns(4)
-        for i, row in df.iterrows():
-            with cols[i % 4]:
-                fig = go.Figure(go.Indicator(
-                    mode="gauge+number",
-                    value=row['Price (€)'],
-                    title={'text': row['Ticker'], 'font': {'size': 16, 'color': 'white'}},
-                    gauge={
-                        'axis': {'range': [0, row['Fair Value (€)'] * 1.5], 'tickcolor': "white"},
-                        'bar': {'color': "#58a6ff"},
-                        'bgcolor': "#1e2130",
-                        'threshold': {'line': {'color': "#238636", 'width': 4}, 'value': row['Fair Value (€)']}
-                    }
-                ))
-                fig.update_layout(height=180, margin=dict(l=20,r=20,t=40,b=20), paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+            with col2:
+                # Plotly Chart mit Fair Value Linie
+                fv_val = df.loc[df['Ticker']==selected, 'Fair Value (€)'].values[0]
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=hist.index, y=hist['Close']/eur_usd, name="Kurs (EUR)", line=dict(color='#58a6ff')))
+                fig.add_hline(y=fv_val, line_dash="dash", line_color="green", annotation_text="Fair Value")
+                fig.update_layout(title=f"{selected} Kursverlauf vs. Fair Value", template="plotly_dark", height=400)
                 st.plotly_chart(fig, use_container_width=True)
 
 except Exception as e:
-    st.error(f"Error loading dashboard: {e}")
-
-# --- SIDEBAR ---
-with st.sidebar:
-    st.header("⚙️ Settings")
-    new_t = st.text_input("Add Ticker").upper()
-    if st.button("Add to List"):
-        if new_t:
-            db.table("watchlist").insert({"ticker": new_t}).execute()
-            st.rerun()
-    
-    st.divider()
-    if st.button("🔄 Force Refresh"):
-        st.cache_data.clear()
-        st.rerun()
+    st.error(f"Fehler im Dashboard: {e}")
