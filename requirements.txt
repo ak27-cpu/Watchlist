@@ -5,7 +5,4 @@ pandas-ta
 supabase
 plotly
 yfinance>=0.2.40
-
-Session
 CacheControl
-retry
