@@ -12,8 +12,8 @@ st.set_page_config(page_title="Stock Strategy Analysis", layout="wide")
 @st.cache_resource
 def init_supabase():
     try:
-        url = st.secrets["https://zwpolcwutolohujqzrjt.supabase.co"]
-        key = st.secrets["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp3cG9sY3d1dG9sb2h1anF6cmp0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjY3OTkzOTAsImV4cCI6MjA4MjM3NTM5MH0.Ca0hYmOZCyWslbjyWvmUew9mL5I8_FcRZiim-afdaWE"]
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
         return create_client(url, key)
     except Exception as e:
         st.error(f"Verbindungsfehler zu Supabase: {e}")
