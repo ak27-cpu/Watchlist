@@ -1,7 +1,6 @@
-pip install 
-streamlit 
-yfinance 
-pandas 
-pandas-ta 
-plotly 
+streamlit
+yfinance
+pandas
+pandas-ta
 supabase
+plotly
