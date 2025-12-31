@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from supabase import create_client, Client
 import time
+from datetime import datetime
 
 st.set_page_config(page_title="Equity Intelligence Pro", layout="wide")
 st.markdown("""
@@ -64,10 +65,41 @@ def get_eur_usd():
         pass
     return FALLBACK_EUR_USD
 
+def get_fair_value_from_db(ticker: str) -> dict | None:
+    """Lade Fair Value aus Datenbank"""
+    db = init_db()
+    try:
+        res = db.table("fair_values").select("*").eq("ticker", ticker).execute()
+        if res.data:
+            return res.data[0]
+        return None
+    except Exception:
+        return None
+
+def save_fair_value_to_db(ticker: str, fv_usd: float, fv_eur: float, source: str = "manual"):
+    """Speichere Fair Value in Datenbank"""
+    db = init_db()
+    try:
+        existing = get_fair_value_from_db(ticker)
+        data = {
+            "ticker": ticker,
+            "fair_value_usd": fv_usd,
+            "fair_value_eur": fv_eur,
+            "source": source,
+            "updated_at": datetime.now().isoformat()
+        }
+        if existing:
+            db.table("fair_values").update(data).eq("ticker", ticker).execute()
+            return "✅ Fair Value aktualisiert"
+        else:
+            db.table("fair_values").insert(data).execute()
+            return "✅ Fair Value gespeichert"
+    except Exception as e:
+        return f"❌ Fehler: {str(e)}"
+
 def calculate_dcf_fair_value_eps(eps: float, growth_rate: float = 0.10) -> dict:
     """
     DCF-Bewertung basierend auf EPS (wie Aktienfinder)
-    Statt FCF - damit näher am realen Modell
     """
     
     if eps <= 0:
@@ -232,6 +264,11 @@ try:
         price_usd = info.get('currentPrice') or hist['Close'].iloc[-1]
         fv_usd = dcf_result.get('fv', 0)
         
+        # Prüfe ob manueller Fair Value in DB existiert
+        db_fv = get_fair_value_from_db(t)
+        if db_fv:
+            fv_usd = db_fv.get('fair_value_usd', fv_usd)
+        
         if fv_usd <= 0:
             continue
         
@@ -262,7 +299,8 @@ try:
             "_trend": tech_metrics['trend'],
             "_vol": tech_metrics['volume'],
             "_rank": rank,
-            "_ema200": tech_metrics['ema200']
+            "_ema200": tech_metrics['ema200'],
+            "_ath": tech_metrics['ath']
         })
 
     if all_results:
@@ -302,6 +340,79 @@ try:
             col2.metric("PV (10 Jahre)", f"${row['_pv_10y']:.2f}")
             col3.metric("PV Terminal", f"${row['_pv_terminal']:.2f}")
             col4.metric("Fair Value", f"${row['_fv_usd']:.2f}")
+            
+            st.divider()
+            
+            # === MANUELLER FAIR VALUE EDIT ===
+            st.subheader("✏️ Fair Value Editor")
+            col_fv1, col_fv2 = st.columns([3, 1])
+            
+            with col_fv1:
+                new_fv_usd = st.number_input(
+                    f"Fair Value ({selected}) in USD anpassen:",
+                    value=row['_fv_usd'],
+                    step=1.0,
+                    min_value=0.1
+                )
+            
+            with col_fv2:
+                if st.button("💾 Speichern", key=f"save_fv_{selected}"):
+                    new_fv_eur = new_fv_usd / eur_usd
+                    msg = save_fair_value_to_db(selected, new_fv_usd, new_fv_eur, source="manual")
+                    st.success(msg)
+                    st.cache_data.clear()
+                    st.rerun()
+            
+            st.divider()
+            
+            # === ENTRY TRANCHES ===
+            st.subheader("🎯 Entry Tranches (basierend auf ATH)")
+            
+            ath_price = row['_ath']
+            current_price_usd = row['_price_usd']
+            
+            col_tranche1, col_tranche2, col_tranche3 = st.columns([2, 2, 2])
+            
+            with col_tranche1:
+                st.markdown("**Tranche 1:**")
+                tranche1_pct = st.slider(
+                    "Abschlag von ATH (%)",
+                    min_value=1, max_value=50, value=10, step=1, key=f"t1_{selected}"
+                )
+                tranche1_price = ath_price * (1 - tranche1_pct / 100)
+                tranche1_eur = tranche1_price / eur_usd
+                st.metric(
+                    f"Einstieg -{tranche1_pct}% vom ATH",
+                    f"${tranche1_price:.2f}",
+                    delta=f"≈ €{tranche1_eur:.2f}"
+                )
+            
+            with col_tranche2:
+                st.markdown("**Tranche 2:**")
+                tranche2_pct = st.slider(
+                    "Abschlag von ATH (%)",
+                    min_value=1, max_value=50, value=20, step=1, key=f"t2_{selected}"
+                )
+                tranche2_price = ath_price * (1 - tranche2_pct / 100)
+                tranche2_eur = tranche2_price / eur_usd
+                st.metric(
+                    f"Einstieg -{tranche2_pct}% vom ATH",
+                    f"${tranche2_price:.2f}",
+                    delta=f"≈ €{tranche2_eur:.2f}"
+                )
+            
+            with col_tranche3:
+                st.markdown("**Aktuell:**")
+                current_from_ath = ((current_price_usd - ath_price) / ath_price) * 100
+                st.metric(
+                    "Korrektur vom ATH",
+                    f"{current_from_ath:.1f}%",
+                    delta=f"${current_price_usd:.2f}"
+                )
+            
+            st.info(f"📊 All-Time-High: ${ath_price:.2f} (≈ €{ath_price/eur_usd:.2f})")
+            
+            st.divider()
             
             eps_val = row['_eps']
             fv_usd_val = row['_fv_usd']
@@ -348,7 +459,7 @@ try:
                 shared_xaxes=True,
                 vertical_spacing=0.08,
                 row_heights=[0.7, 0.3],
-                subplot_titles=(f"{selected} - Preis & DCF Fair Value", "RSI (14)")
+                subplot_titles=(f"{selected} - Preis & DCF Fair Value + Tranchen", "RSI (14)")
             )
             
             hist_eur = hist['Close'] / eur_usd
@@ -383,8 +494,15 @@ try:
                           name=f"Buy Zone (±{mos_pct*100:.0f}%)"),
                 row=1, col=1
             )
+            
             fig.add_hline(y=fv_eur, line_dash="dash", line_color="#28a745",
                          annotation_text="Fair Value (DCF)", row=1, col=1)
+            
+            # Tranchen hinzufügen
+            fig.add_hline(y=tranche1_eur, line_dash="dot", line_color="#ffa500",
+                         annotation_text=f"Tranche 1 (-{tranche1_pct}%)", row=1, col=1)
+            fig.add_hline(y=tranche2_eur, line_dash="dot", line_color="#ff0000",
+                         annotation_text=f"Tranche 2 (-{tranche2_pct}%)", row=1, col=1)
 
             rsi = ta.rsi(hist['Close'], length=RSI_LENGTH)
             fig.add_trace(
