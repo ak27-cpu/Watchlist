@@ -5,7 +5,6 @@ import pandas_ta as ta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from supabase import create_client, Client
-from concurrent.futures import ThreadPoolExecutor
 import time
 import numpy as np
 
@@ -31,7 +30,6 @@ DRAWDOWN_THRESHOLD = -0.10
 FALLBACK_EUR_USD = 1.05
 FALLBACK_KGV = 20.0
 FALLBACK_EPS = 1.0
-MAX_WORKERS = 8
 
 # --- 3. HILFSFUNKTIONEN ---
 @st.cache_resource
@@ -49,7 +47,6 @@ def get_market_data(ticker: str) -> tuple | None:
             return None
         return hist, tk.info
     except Exception as e:
-        st.warning(f"Fehler beim Laden von {ticker}: {e}")
         return None
 
 @st.cache_data(ttl=WATCHLIST_CACHE_TTL, show_spinner=False)
@@ -66,33 +63,14 @@ def get_watchlist():
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_eur_usd():
-    """EUR/USD Kurs laden, separat gecacht"""
+    """EUR/USD Kurs laden mit Fallback"""
     try:
         eur_usd_data = yf.download("EURUSD=X", period="1d", progress=False)
         if not eur_usd_data.empty:
             return float(eur_usd_data['Close'].iloc[-1])
-    except Exception as e:
-        st.warning(f"Fehler beim EUR/USD-Kurs: {e}")
+    except Exception:
+        pass
     return FALLBACK_EUR_USD
-
-def load_all_market_data(tickers):
-    """Lädt Marktdaten für alle Ticker parallel mit ThreadPoolExecutor"""
-    results = {}
-    workers = min(MAX_WORKERS, len(tickers))
-    
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_ticker = {
-            executor.submit(get_market_data, t): t for t in tickers
-        }
-        for future in future_to_ticker:
-            t = future_to_ticker[future]
-            try:
-                data = future.result(timeout=30)
-                if data:
-                    results[t] = data
-            except Exception:
-                continue
-    return results
 
 def calculate_avg_drawdown(hist: pd.DataFrame) -> float:
     """Berechne durchschnittlichen Drawdown > 10%"""
@@ -102,13 +80,7 @@ def calculate_avg_drawdown(hist: pd.DataFrame) -> float:
     return significant_drawdowns.mean() * 100 if not significant_drawdowns.empty else 0.0
 
 def calculate_historical_kgv_median(hist: pd.DataFrame, info: dict) -> tuple[float, float]:
-    """
-    SCHRITT 2: Ermittle den historischen KGV-Schnitt (10-Jahres-Median) aus maximaler Historie
-    
-    Returns: (kgv_median, kgv_lower)
-    - kgv_median: Oberes KGV (normal/optimistisch)
-    - kgv_lower: Unteres KGV (Median × 0.8 = -20% Sicherheitsabschlag konservativ)
-    """
+    """SCHRITT 2: Ermittle den historischen KGV-Schnitt (10-Jahres-Median)"""
     try:
         eps_ttm = info.get('trailingEps') or 1.0
         
@@ -117,26 +89,18 @@ def calculate_historical_kgv_median(hist: pd.DataFrame, info: dict) -> tuple[flo
             kgv_lower = kgv_median * 0.8
             return kgv_median, kgv_lower
         
-        # Nutze maximale Historie (bis zu 10+ Jahren)
-        hist_10y = hist.tail(2520)  # ~10 Jahre à 252 Handelstage/Jahr
+        hist_10y = hist.tail(2520)
         
         if not hist_10y.empty and len(hist_10y) > 100:
-            # Berechne KGV für jeden Tag: Close / EPS
-            # (Vereinfacht: nutze TTM EPS als konstant, idealerweise würde man historische EPS nutzen)
             kgv_series = hist_10y['Close'] / eps_ttm
-            
-            # Berechne Median über 10 Jahre
             kgv_median = kgv_series.median()
             
-            # Validierung: Falls KGV unrealistisch ist
             if kgv_median <= 0 or kgv_median > 1000:
                 kgv_median = info.get('forwardPE') or FALLBACK_KGV
         else:
             kgv_median = info.get('forwardPE') or FALLBACK_KGV
         
-        # Unteres KGV: -20% Sicherheitsabschlag
         kgv_lower = kgv_median * 0.8
-        
         return kgv_median, kgv_lower
             
     except Exception:
@@ -145,14 +109,7 @@ def calculate_historical_kgv_median(hist: pd.DataFrame, info: dict) -> tuple[flo
         return kgv_median, kgv_lower
 
 def calculate_fair_value(eps: float, kgv_lower: float, kgv_upper: float) -> tuple[float, float, float]:
-    """
-    SCHRITT 3 & 4: Berechne Fair-Value-Szenarien:
-    - Konservativ: EPS 2026 × unteres KGV
-    - Optimistisch: EPS 2026 × oberes KGV
-    - Gemittelt: Mittelwert aus beiden Szenarien
-    
-    Returns: (fv_konservativ, fv_optimistisch, fv_gemittelt)
-    """
+    """SCHRITT 3 & 4: Berechne Fair-Value-Szenarien"""
     fv_konservativ = eps * kgv_lower
     fv_optimistisch = eps * kgv_upper
     fv_gemittelt = (fv_konservativ + fv_optimistisch) / 2
@@ -160,7 +117,7 @@ def calculate_fair_value(eps: float, kgv_lower: float, kgv_upper: float) -> tupl
     return fv_konservativ, fv_optimistisch, fv_gemittelt
 
 def calculate_technical_metrics(hist: pd.DataFrame, price_usd: float) -> dict:
-    """Berechne alle technischen Metriken in einer Funktion"""
+    """Berechne alle technischen Metriken"""
     metrics = {}
     metrics['rsi'] = ta.rsi(hist['Close'], length=RSI_LENGTH).iloc[-1]
     
@@ -238,17 +195,26 @@ try:
     eur_usd = get_eur_usd()
     all_results = []
 
-    with st.spinner(f'Lade maximale Marktdaten parallel für {len(tickers)} Ticker...'):
+    with st.spinner(f'Lade Marktdaten für {len(tickers)} Ticker (SEQUENTIAL - Rate Limit Safe)...'):
         start_time = time.time()
-        market_data_map = load_all_market_data(tickers)
+        market_data_map = {}
+        
+        # SEQUENZIELL laden statt parallel (verhindert Rate Limiting)
+        for idx, t in enumerate(tickers):
+            st.write(f"⏳ Lade {t}... ({idx+1}/{len(tickers)})")
+            time.sleep(0.5)  # Delay zwischen Requests
+            data = get_market_data(t)
+            if data:
+                market_data_map[t] = data
+        
         load_time = time.time() - start_time
 
     if not market_data_map:
-        st.warning("Keine Marktdaten geladen. Möglicherweise blockiert Yahoo Finance die Anfragen. Bitte warte eine Minute und drücke 'Daten aktualisieren'.")
+        st.warning("⚠️ Keine Marktdaten geladen. Yahoo Finance blockiert wahrscheinlich die Anfragen. Bitte warte eine Minute und versuche erneut.")
         st.stop()
 
     col1, col2, col3 = st.columns([2, 1, 1])
-    col1.info(f"✅ {len(market_data_map)}/{len(tickers)} Ticker geladen in {load_time:.2f}s (parallel)")
+    col1.info(f"✅ {len(market_data_map)}/{len(tickers)} Ticker geladen in {load_time:.2f}s (sequenziell)")
     
     for t in tickers:
         if t not in market_data_map:
@@ -256,26 +222,19 @@ try:
 
         hist, info = market_data_map[t]
 
-        # --- SCHRITT 1: EPS 2026 ---
         eps_2026 = info.get('forwardEps') or info.get('trailingEps') or FALLBACK_EPS
-        
-        # --- SCHRITT 2: 10-Jahres-Median KGV ---
         kgv_median, kgv_lower = calculate_historical_kgv_median(hist, info)
-        
         price_usd = info.get('currentPrice') or hist['Close'].iloc[-1]
 
-        # --- SCHRITT 3 & 4: Fair Value Szenarien ---
         fv_konservativ, fv_optimistisch, fv_gemittelt = calculate_fair_value(eps_2026, kgv_lower, kgv_median)
         
         fv_eur = fv_gemittelt / eur_usd
         price_eur = price_usd / eur_usd
         upside = ((fv_eur - price_eur) / price_eur) * 100
 
-        # Technische Metriken
         tech_metrics = calculate_technical_metrics(hist, price_usd)
         rsi_now = tech_metrics['rsi']
 
-        # Signal
         signal, rank = generate_signal(price_eur, fv_eur, rsi_now, mos_pct)
 
         all_results.append({
@@ -330,7 +289,6 @@ try:
             row = df[df['Ticker'] == selected].iloc[0]
             hist, _ = market_data_map[selected]
 
-            # --- FAIR-VALUE DETAILS ---
             st.subheader(f"Fair-Value-Methode: {selected}")
             fv_col1, fv_col2, fv_col3, fv_col4 = st.columns(4)
             fv_col1.metric("EPS 2026", f"${row['_eps_2026']:.2f}")
@@ -347,7 +305,6 @@ try:
 
             st.divider()
 
-            # --- TECHNISCHE METRIKEN ---
             col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("Kurs", f"{row['_price_usd']:.2f} $", delta=f"≈ {row['Kurs (€)']:.2f} €", delta_color="off")
             col2.metric("Fair Value Ø", f"{row['_fv_usd']:.2f} $", delta=f"≈ {row['Fair Value (€)']:.2f} €", delta_color="off")
@@ -357,7 +314,6 @@ try:
             col4.metric("Korrektur (ATH)", f"{row['_corr_ath']:.1f}%", delta=f"Ø: {row['_avg_dd']:.1f}%", delta_color="off")
             col5.metric("Trend / Vol", f"{row['_trend']}", delta=f"{row['_vol']}")
 
-            # --- CHART ---
             fig = make_subplots(
                 rows=2, cols=1,
                 shared_xaxes=True,
@@ -423,7 +379,7 @@ try:
             
             st.plotly_chart(fig, use_container_width=True)
     else:
-        st.warning("Keine Daten verfügbar. Yahoo Finance blockiert möglicherweise die Anfragen. Bitte warten und erneut versuchen.")
+        st.warning("Keine Daten verfügbar. Bitte versuche es später erneut.")
 
 except Exception as e:
     st.error(f"Systemfehler: {e}")
