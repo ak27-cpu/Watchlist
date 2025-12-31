@@ -326,39 +326,48 @@ try:
         st.subheader("🔬 DCF-Tiefenanalyse")
         selected = st.selectbox("Ticker auswählen", df['Ticker'].values)
         
-        if selected:
-            row = df[df['Ticker'] == selected].iloc[0]
-            hist, info = market_data_map[selected]
+       # --- Ersetze diesen kompletten Abschnitt ---
+if selected:
+    row = df[df['Ticker'] == selected].iloc[0]
+    hist, info = market_data_map[selected]
 
-            st.subheader(f"DCF Fair Value Analyse: {selected}")
-            
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("FCF/Share", f"${row['_fcf_per_share']:.2f}")
-            col2.metric("PV (10 Jahre)", f"${row['_pv_10y']:.2f}")
-            col3.metric("PV Terminal", f"${row['_pv_terminal']:.2f}")
-            col4.metric("Fair Value", f"${row['_fv_usd']:.2f}")
-            
-            st.markdown(f"""
-            **DCF-Berechnung (Buffett-Style):**
-            
-            **Annahmen:**
-            - Free Cash Flow pro Share: **${row['_fcf_per_share']:.2f}**
-            - Wachstum 10 Jahre: **{growth_rate*100:.0f}%**
-            - WACC (Discount Rate): **{WACC*100:.2f}%**
-            - Terminal Growth: **{TERMINAL_GROWTH*100:.1f}%**
-            
-            **Bewertung:**
-            - PV (Cash Flows Jahre 1-10): **${row['_pv_10y']:.2f}**
-            - PV (Terminal Value): **${row['_pv_terminal']:.2f}**
-            
-            **Fair Value Gesamt: ${row['_fv_usd']:.2f} ≈ €{row['Fair Value (€)']:.2f}**
+    st.subheader(f"DCF Fair Value Analyse: {selected}")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("FCF/Share", f"${row['_fcf_per_share']:.2f}")
+    col2.metric("PV (10 Jahre)", f"${row['_pv_10y']:.2f}")
+    col3.metric("PV Terminal", f"${row['_pv_terminal']:.2f}")
+    col4.metric("Fair Value", f"${row['_fv_usd']:.2f}")
+    
+    # FIX: Variablen extrahieren für f-string
+    fcf_share = row['_fcf_per_share']
+    fv_usd = row['_fv_usd']
+    fv_eur = row['Fair Value (€)']
+    kurs_eur = row['Kurs (€)']
+    upside_pct = row['Upside (%)']
+    signal = row['Signal']
+    
+    st.markdown(f"""
+    **DCF-Berechnung (Buffett-Style):**
+    
+    **Annahmen:**
+    - Free Cash Flow pro Share: **${fcf_share:.2f}**
+    - Wachstum 10 Jahre: **{growth_rate*100:.0f}%**
+    - WACC (Discount Rate): **{WACC*100:.2f}%**
+    - Terminal Growth: **{TERMINAL_GROWTH*100:.1f}%**
+    
+    **Bewertung:**
+    - PV (Cash Flows Jahre 1-10): **${row['_pv_10y']:.2f}**
+    - PV (Terminal Value): **${row['_pv_terminal']:.2f}**
+    
+    **Fair Value Gesamt: ${fv_usd:.2f} ≈ €{fv_eur:.2f}**
+    
+    **Einschätzung:**
+    - Aktueller Kurs: **€{kurs_eur:.2f}**
+    - Upside: **{upside_pct:.1f}%**
+    - Signal: **{signal}**
+    """)
 
-            
-            **Einschätzung:**
-            - Aktueller Kurs: **€{row['Kurs (€)']:.2f}}**
-            - Upside: **{row['Upside (%)']:.1f}%**
-            - Signal: **{row['Signal']}**
-            """)
 
             st.divider()
 
