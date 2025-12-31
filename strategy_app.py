@@ -27,9 +27,11 @@ EMA_LENGTH = 200
 VOLUME_THRESHOLD_UP = 1.5
 VOLUME_THRESHOLD_DOWN = 0.8
 DRAWDOWN_THRESHOLD = -0.10
-FALLBACK_EUR_USD = 1.05
-FALLBACK_KGV = 20.0
-FALLBACK_EPS = 1.0
+FALLBACK_EUR_USD = 1.055
+
+# DCF Parameter
+WACC = 0.0989  # 9.89% (Standard für Quality Companies)
+TERMINAL_GROWTH = 0.025  # 2.5% (langfristiges GDP-Wachstum)
 
 # --- 3. HILFSFUNKTIONEN ---
 @st.cache_resource
@@ -39,80 +41,39 @@ def init_db():
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_market_data(ticker: str) -> tuple | None:
-    """Lade maximale historische Daten (period='max')"""
+    """Lade maximale historische Daten"""
     try:
         tk = yf.Ticker(ticker)
         hist = tk.history(period="max")
         if hist.empty:
             return None
         return hist, tk.info
-    except Exception as e:
+    except Exception:
         return None
 
 @st.cache_data(ttl=WATCHLIST_CACHE_TTL, show_spinner=False)
 def get_watchlist():
-    """Watchlist aus Supabase laden und 10 Minuten cachen"""
+    """Watchlist aus Supabase laden"""
     db = init_db()
     try:
         res = db.table("watchlist").select("ticker").execute()
         tickers = sorted(list(set(t['ticker'].upper() for t in res.data)))
         return tickers
-    except Exception as e:
-        st.error(f"Fehler beim Laden der Watchlist: {e}")
+    except Exception:
         return []
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def get_eur_usd():
-    """EUR/USD Kurs laden mit Fallback (Rate Limit Safe)"""
+    """EUR/USD Kurs laden mit Fallback"""
     try:
         eur_usd_data = yf.download("EURUSD=X", period="1d", progress=False)
         if not eur_usd_data.empty:
             rate = float(eur_usd_data['Close'].iloc[-1])
-            if 0.9 < rate < 1.2:  # Sanity check
+            if 0.9 < rate < 1.2:
                 return rate
     except Exception:
         pass
-    # Fallback: Hardcodierter Wert (aktuell ~1.055)
-    return 1.055
-
-
-def calculate_avg_drawdown(hist: pd.DataFrame) -> float:
-    """Berechne durchschnittlichen Drawdown > 10%"""
-    running_max = hist['Close'].cummax()
-    drawdown = (hist['Close'] - running_max) / running_max
-    significant_drawdowns = drawdown[drawdown < DRAWDOWN_THRESHOLD]
-    return significant_drawdowns.mean() * 100 if not significant_drawdowns.empty else 0.0
-
-def calculate_kgv_trend(hist: pd.DataFrame, info: dict) -> tuple[float, float]:
-    """
-    Berechne KGV aktuell und KGV Trend (nächster Punkt)
-    - KGV aktuell: Basierend auf aktuellem Kurs und EPS
-    - KGV nächster Punkt: Median der letzten 2 Jahre (Trend)
-    """
-    try:
-        eps_ttm = info.get('trailingEps') or 1.0
-        if eps_ttm <= 0:
-            eps_ttm = 1.0
-        
-        price_usd = info.get('currentPrice') or hist['Close'].iloc[-1]
-        kgv_current = price_usd / eps_ttm
-        
-        # KGV Trend: Median der letzten 2 Jahre
-        hist_2y = hist.tail(504)  # ~2 Jahre
-        if not hist_2y.empty and len(hist_2y) > 50:
-            kgv_series = hist_2y['Close'] / eps_ttm
-            kgv_trend = kgv_series.median()
-            
-            # Validierung
-            if kgv_trend <= 0 or kgv_trend > 1000:
-                kgv_trend = kgv_current
-        else:
-            kgv_trend = kgv_current
-        
-        return kgv_current, kgv_trend
-            
-    except Exception:
-        return FALLBACK_KGV, FALLBACK_KGV
+    return FALLBACK_EUR_USD
 
 def calculate_fcf_per_share(info: dict) -> float:
     """Berechne Free Cash Flow pro Aktie"""
@@ -125,31 +86,65 @@ def calculate_fcf_per_share(info: dict) -> float:
         pass
     return 0.0
 
-def calculate_fair_value_dual(eps: float, fcf_per_share: float, kgv_current: float, kgv_trend: float) -> tuple[float, float, float]:
+def calculate_dcf_fair_value(fcf_per_share: float, growth_rate: float = 0.10, wacc: float = WACC, terminal_growth: float = TERMINAL_GROWTH) -> dict:
     """
-    DUAL METHOD - wie Aktienfinder:
-    - FV bereinigt (KGV): EPS × Mittelwert(KGV aktuell, KGV trend)
-    - FV Cashflow (KCV): FCF per Share × KCV (vereinfacht: KGV * 0.9)
-    - FV Gesamt: Mittelwert beider Methoden
+    DCF-Bewertung (Buffett-Style)
+    
+    Simplified Gordon Growth Model:
+    Fair Value = FCF_pro_Share × (1 + Growth) / (WACC - Growth)
+    
+    Plus 10-Jahres Projection für Details
     """
-    # Methode 1: KGV-basiert
-    kgv_avg = (kgv_current + kgv_trend) / 2
-    fv_kgv = eps * kgv_avg
     
-    # Methode 2: Cashflow-basiert (KCV ≈ KGV * 0.9)
-    if fcf_per_share > 0:
-        kcv = kgv_avg * 0.9
-        fv_fcf = fcf_per_share * kcv
-    else:
-        fv_fcf = fv_kgv  # Fallback
+    if fcf_per_share <= 0:
+        return {"fv": 0, "pv_10y": 0, "pv_terminal": 0, "error": True}
     
-    # Mittelwert
-    fv_gesamt = (fv_kgv + fv_fcf) / 2
+    try:
+        # Vereinfachte Gordon Growth Model
+        if wacc <= growth_rate:
+            # Fallback wenn Wachstum >= WACC (unrealistisch)
+            fv = fcf_per_share * 15  # Einfacher Multiplikator
+            return {"fv": fv, "pv_10y": fv * 0.7, "pv_terminal": fv * 0.3, "method": "Fallback"}
+        
+        # DCF 10-Jahres Projection
+        pv_10y = 0
+        fcf_current = fcf_per_share
+        
+        for year in range(1, 11):
+            fcf_projected = fcf_per_share * ((1 + growth_rate) ** year)
+            pv = fcf_projected / ((1 + wacc) ** year)
+            pv_10y += pv
+        
+        # Terminal Value (Gordon Growth nach Jahr 10)
+        fcf_year10 = fcf_per_share * ((1 + growth_rate) ** 10)
+        terminal_value = (fcf_year10 * (1 + terminal_growth)) / (wacc - terminal_growth)
+        pv_terminal = terminal_value / ((1 + wacc) ** 10)
+        
+        # Fair Value = Sum PV 10 Jahre + PV Terminal Value
+        fv = pv_10y + pv_terminal
+        
+        return {
+            "fv": fv,
+            "pv_10y": pv_10y,
+            "pv_terminal": pv_terminal,
+            "fcf_year10": fcf_year10,
+            "terminal_value": terminal_value,
+            "error": False,
+            "method": "DCF 10-Year + Terminal"
+        }
     
-    return fv_kgv, fv_fcf, fv_gesamt
+    except Exception as e:
+        return {"fv": 0, "error": True, "error_msg": str(e)}
+
+def calculate_avg_drawdown(hist: pd.DataFrame) -> float:
+    """Berechne durchschnittlichen Drawdown"""
+    running_max = hist['Close'].cummax()
+    drawdown = (hist['Close'] - running_max) / running_max
+    significant_drawdowns = drawdown[drawdown < DRAWDOWN_THRESHOLD]
+    return significant_drawdowns.mean() * 100 if not significant_drawdowns.empty else 0.0
 
 def calculate_technical_metrics(hist: pd.DataFrame, price_usd: float) -> dict:
-    """Berechne alle technischen Metriken"""
+    """Berechne technische Metriken"""
     metrics = {}
     metrics['rsi'] = ta.rsi(hist['Close'], length=RSI_LENGTH).iloc[-1]
     
@@ -177,7 +172,7 @@ def calculate_technical_metrics(hist: pd.DataFrame, price_usd: float) -> dict:
     return metrics
 
 def generate_signal(price_eur: float, fv_eur: float, rsi: float, mos_pct: float) -> tuple[str, int]:
-    """Generiere Kauf-Signal und Ranking"""
+    """Generiere Kauf-Signal"""
     buy_limit = fv_eur * (1 - mos_pct)
     watch_limit = fv_eur * (1 + mos_pct)
     
@@ -190,12 +185,30 @@ def generate_signal(price_eur: float, fv_eur: float, rsi: float, mos_pct: float)
 
 # --- 4. HAUPTPROGRAMM ---
 db = init_db()
-st.title("💎 Equity Intelligence: Fair Value (Dual-Method)")
+st.title("💎 Equity Intelligence: DCF Fair Value (Buffett-Style)")
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.header("⚙️ Strategie Parameter")
-    mos_pct = st.slider("Margin of Safety (Kauf-Zone)", min_value=1, max_value=30, value=10, step=1) / 100
+    st.header("⚙️ DCF Parameter")
+    
+    growth_scenario = st.selectbox(
+        "Wachstums-Szenario",
+        ["🟢 Optimistisch (12%)", "🟡 Base Case (10%)", "🔴 Konservativ (8%)"],
+        index=1
+    )
+    
+    growth_map = {
+        "🟢 Optimistisch (12%)": 0.12,
+        "🟡 Base Case (10%)": 0.10,
+        "🔴 Konservativ (8%)": 0.08
+    }
+    growth_rate = growth_map[growth_scenario]
+    
+    st.metric("WACC (Discount Rate)", f"{WACC*100:.2f}%")
+    st.metric("Terminal Growth", f"{TERMINAL_GROWTH*100:.1f}%")
+    
+    st.divider()
+    mos_pct = st.slider("Margin of Safety", min_value=1, max_value=30, value=15, step=1) / 100
     
     st.divider()
     if st.button("🔄 Daten aktualisieren"):
@@ -210,18 +223,14 @@ with st.sidebar:
                 db.table("watchlist").insert({"ticker": new_ticker}).execute()
                 st.cache_data.clear()
                 st.rerun()
-            except Exception as e:
-                st.error(f"Fehler beim Speichern: {e}")
-        elif not new_ticker:
-            st.warning("Bitte Ticker eingeben")
-        else:
-            st.warning("Ticker zu lang")
+            except:
+                st.error("Fehler beim Speichern")
 
 try:
     tickers = get_watchlist()
     
     if not tickers:
-        st.info("Bitte Ticker hinzufügen.")
+        st.info("Bitte Ticker hinzufügen (z.B. V für Visa)")
         st.stop()
     
     eur_usd = get_eur_usd()
@@ -231,9 +240,8 @@ try:
         start_time = time.time()
         market_data_map = {}
         
-        # SEQUENZIELL laden statt parallel (verhindert Rate Limiting)
-        for idx, t in enumerate(tickers):
-            time.sleep(0.5)  # Delay zwischen Requests
+        for t in tickers:
+            time.sleep(0.5)
             data = get_market_data(t)
             if data:
                 market_data_map[t] = data
@@ -241,34 +249,34 @@ try:
         load_time = time.time() - start_time
 
     if not market_data_map:
-        st.warning("⚠️ Keine Marktdaten geladen. Yahoo Finance blockiert wahrscheinlich die Anfragen. Bitte warte eine Minute und versuche erneut.")
+        st.warning("⚠️ Keine Daten geladen. Bitte später versuchen.")
         st.stop()
 
     col1, col2, col3 = st.columns([2, 1, 1])
-    col1.info(f"✅ {len(market_data_map)}/{len(tickers)} Ticker geladen in {load_time:.2f}s")
+    col1.info(f"✅ {len(market_data_map)}/{len(tickers)} Ticker | Growth: {growth_rate*100:.0f}%")
     
     for t in tickers:
         if t not in market_data_map:
             continue
 
         hist, info = market_data_map[t]
-
-        # --- BERECHNUNG ---
-        eps = info.get('trailingEps') or FALLBACK_EPS
-        fcf_per_share = calculate_fcf_per_share(info)
-        kgv_current, kgv_trend = calculate_kgv_trend(hist, info)
-        price_usd = info.get('currentPrice') or hist['Close'].iloc[-1]
-
-        # Fair Value (Dual Method)
-        fv_kgv, fv_fcf, fv_gesamt = calculate_fair_value_dual(eps, fcf_per_share, kgv_current, kgv_trend)
         
-        fv_eur = fv_gesamt / eur_usd
+        # --- DCF BERECHNUNG ---
+        fcf_per_share = calculate_fcf_per_share(info)
+        dcf_result = calculate_dcf_fair_value(fcf_per_share, growth_rate=growth_rate)
+        
+        price_usd = info.get('currentPrice') or hist['Close'].iloc[-1]
+        fv_usd = dcf_result.get('fv', 0)
+        
+        if fv_usd <= 0:
+            continue  # Überspringe wenn keine gültigen Daten
+        
+        fv_eur = fv_usd / eur_usd
         price_eur = price_usd / eur_usd
         upside = ((fv_eur - price_eur) / price_eur) * 100
 
         tech_metrics = calculate_technical_metrics(hist, price_usd)
         rsi_now = tech_metrics['rsi']
-
         signal, rank = generate_signal(price_eur, fv_eur, rsi_now, mos_pct)
 
         all_results.append({
@@ -279,13 +287,11 @@ try:
             "RSI": rsi_now,
             "Signal": signal,
             "_price_usd": price_usd,
-            "_fv_gesamt_usd": fv_gesamt,
-            "_fv_kgv_usd": fv_kgv,
-            "_fv_fcf_usd": fv_fcf,
-            "_kgv_current": kgv_current,
-            "_kgv_trend": kgv_trend,
-            "_eps": eps,
+            "_fv_usd": fv_usd,
             "_fcf_per_share": fcf_per_share,
+            "_pv_10y": dcf_result.get('pv_10y', 0),
+            "_pv_terminal": dcf_result.get('pv_terminal', 0),
+            "_fcf_year10": dcf_result.get('fcf_year10', 0),
             "_corr_ath": tech_metrics['corr_ath'],
             "_avg_dd": tech_metrics['avg_dd'],
             "_trend": tech_metrics['trend'],
@@ -317,53 +323,57 @@ try:
 
         st.divider()
 
-        st.subheader("🔬 Tiefenanalyse")
+        st.subheader("🔬 DCF-Tiefenanalyse")
         selected = st.selectbox("Ticker auswählen", df['Ticker'].values)
         
         if selected:
             row = df[df['Ticker'] == selected].iloc[0]
-            hist, _ = market_data_map[selected]
+            hist, info = market_data_map[selected]
 
-            st.subheader(f"Fair-Value-Analyse: {selected} (Dual-Method)")
+            st.subheader(f"DCF Fair Value Analyse: {selected}")
             
             col1, col2, col3, col4 = st.columns(4)
-            col1.metric("EPS (TTM)", f"${row['_eps']:.2f}")
-            col2.metric("KGV aktuell", f"{row['_kgv_current']:.1f}x")
-            col3.metric("KGV Trend", f"{row['_kgv_trend']:.1f}x")
-            col4.metric("FCF/Share", f"${row['_fcf_per_share']:.2f}")
+            col1.metric("FCF/Share", f"${row['_fcf_per_share']:.2f}")
+            col2.metric("PV (10 Jahre)", f"${row['_pv_10y']:.2f}")
+            col3.metric("PV Terminal", f"${row['_pv_terminal']:.2f}")
+            col4.metric("Fair Value", f"${row['_fv_usd']:.2f}")
             
             st.markdown(f"""
-            **Dual-Method Berechnung:**
+            **DCF-Berechnung (Buffett-Style):**
             
-            **Methode 1 - KGV-basiert:**
-            - KGV Ø = ({row['_kgv_current']:.1f} + {row['_kgv_trend']:.1f}) / 2 = **{(row['_kgv_current'] + row['_kgv_trend'])/2:.1f}x**
-            - FV = ${row['_eps']:.2f} × {(row['_kgv_current'] + row['_kgv_trend'])/2:.1f} = **${row['_fv_kgv_usd']:.2f}**
+            **Annahmen:**
+            - Free Cash Flow pro Share: **${row['_fcf_per_share']:.2f}**
+            - Wachstum 10 Jahre: **{growth_rate*100:.0f}%**
+            - WACC (Discount Rate): **{WACC*100:.2f}%**
+            - Terminal Growth: **{TERMINAL_GROWTH*100:.1f}%**
             
-            **Methode 2 - Cashflow-basiert:**
-            - KCV = KGV Ø × 0.9 = **{(row['_kgv_current'] + row['_kgv_trend'])/2 * 0.9:.1f}**
-            - FV = ${row['_fcf_per_share']:.2f} × {(row['_kgv_current'] + row['_kgv_trend'])/2 * 0.9:.1f} = **${row['_fv_fcf_usd']:.2f}**
+            **Bewertung:**
+            - PV (Cash Flows Jahre 1-10): **${row['_pv_10y']:.2f}**
+            - PV (Terminal Value): **${row['_pv_terminal']:.2f}**
             
-            **Fair Value Gesamt (Mittelwert):**
-            - (${row['_fv_kgv_usd']:.2f} + ${row['_fv_fcf_usd']:.2f}) / 2 = **${row['_fv_gesamt_usd']:.2f}** ≈ **€{row['Fair Value (€)']:.2f}**
+            **Fair Value Gesamt: ${row['_fv_usd']:.2f}} ≈ €{row['Fair Value (€)']:.2f}}**
+            
+            **Einschätzung:**
+            - Aktueller Kurs: **€{row['Kurs (€)']:.2f}}**
+            - Upside: **{row['Upside (%)']:.1f}%**
+            - Signal: **{row['Signal']}**
             """)
 
             st.divider()
 
             col1, col2, col3, col4, col5 = st.columns(5)
             col1.metric("Kurs", f"{row['_price_usd']:.2f} $", delta=f"≈ {row['Kurs (€)']:.2f} €", delta_color="off")
-            col2.metric("Fair Value", f"{row['_fv_gesamt_usd']:.2f} $", delta=f"≈ {row['Fair Value (€)']:.2f} €", delta_color="off")
-            
-            rsi_status = "Überverkauft (<30)" if row['RSI'] < 30 else ("Kaufzone (<40)" if row['RSI'] < 40 else "Neutral")
-            col3.metric("RSI (14)", f"{row['RSI']:.1f}", delta=rsi_status, delta_color="inverse")
-            col4.metric("Korrektur (ATH)", f"{row['_corr_ath']:.1f}%", delta=f"Ø: {row['_avg_dd']:.1f}%", delta_color="off")
-            col5.metric("Trend / Vol", f"{row['_trend']}", delta=f"{row['_vol']}")
+            col2.metric("Fair Value", f"{row['_fv_usd']:.2f} $", delta=f"≈ {row['Fair Value (€)']:.2f} €", delta_color="off")
+            col3.metric("RSI (14)", f"{row['RSI']:.1f}", delta="Buy Zone" if row['RSI'] < 40 else "Neutral", delta_color="inverse")
+            col4.metric("Korrektur", f"{row['_corr_ath']:.1f}%", delta=f"Avg: {row['_avg_dd']:.1f}%", delta_color="off")
+            col5.metric("Trend", f"{row['_trend']}", delta=f"{row['_vol']}")
 
             fig = make_subplots(
                 rows=2, cols=1,
                 shared_xaxes=True,
                 vertical_spacing=0.08,
                 row_heights=[0.7, 0.3],
-                subplot_titles=(f"{selected} - Preis & Fair Value", "RSI (14)")
+                subplot_titles=(f"{selected} - Preis & DCF Fair Value", "RSI (14)")
             )
             
             hist_eur = hist['Close'] / eur_usd
@@ -395,11 +405,11 @@ try:
                 go.Scatter(x=[hist.index[0], hist.index[-1]], y=[mos_lower, mos_lower],
                           mode='lines', line=dict(width=0),
                           fill='tonexty', fillcolor='rgba(40, 167, 69, 0.2)',
-                          name=f"Fair Value Zone (±{mos_pct*100:.0f}%)"),
+                          name=f"Buy Zone (±{mos_pct*100:.0f}%)"),
                 row=1, col=1
             )
             fig.add_hline(y=fv_eur, line_dash="dash", line_color="#28a745",
-                         annotation_text="Fair Value", row=1, col=1)
+                         annotation_text="Fair Value (DCF)", row=1, col=1)
 
             rsi = ta.rsi(hist['Close'], length=RSI_LENGTH)
             fig.add_trace(
@@ -407,7 +417,7 @@ try:
                           line=dict(color='#ff7f0e', width=1.5)),
                 row=2, col=1
             )
-            fig.add_hline(y=40, line_dash="dot", line_color="cyan", annotation_text="Buy", row=2, col=1)
+            fig.add_hline(y=40, line_dash="dot", line_color="cyan", row=2, col=1)
             fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1)
             fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1)
 
@@ -415,7 +425,7 @@ try:
                 height=600,
                 template="plotly_dark",
                 hovermode="x unified",
-                title=f"Chartanalyse: {selected}",
+                title=f"DCF Chartanalyse: {selected} (Growth {growth_rate*100:.0f}%)",
                 xaxis_rangeslider_visible=False
             )
             fig.update_yaxes(title_text="Preis (€)", row=1, col=1)
@@ -423,9 +433,9 @@ try:
             
             st.plotly_chart(fig, use_container_width=True)
     else:
-        st.warning("Keine Daten verfügbar. Bitte versuche es später erneut.")
+        st.warning("Keine gültigen Daten. Stelle sicher, dass Aktien FCF haben.")
 
 except Exception as e:
-    st.error(f"Systemfehler: {e}")
+    st.error(f"Fehler: {e}")
     import traceback
     st.write(traceback.format_exc())
