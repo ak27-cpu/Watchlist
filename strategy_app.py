@@ -7,7 +7,6 @@ from plotly.subplots import make_subplots
 from supabase import create_client, Client
 import time
 from datetime import datetime
-import os
 
 st.set_page_config(page_title="Equity Intelligence Pro", layout="wide")
 st.markdown("""
@@ -67,7 +66,7 @@ def get_eur_usd():
     return FALLBACK_EUR_USD
 
 def get_fair_value_from_db(ticker: str) -> dict | None:
-    """Lade Fair Value aus Datenbank"""
+    """Lade Fair Value aus Datenbank - NICHT gecacht!"""
     db = init_db()
     try:
         res = db.table("fair_values").select("*").eq("ticker", ticker).execute()
@@ -78,30 +77,25 @@ def get_fair_value_from_db(ticker: str) -> dict | None:
         return None
 
 def save_fair_value_to_db(ticker: str, fv_usd: float, fv_eur: float, source: str = "manual"):
-    """Speichere Fair Value in Datenbank"""
+    """Speichere Fair Value in Datenbank - sofort, keine Cache Probleme"""
     db = init_db()
     try:
         existing = get_fair_value_from_db(ticker)
         data = {
             "ticker": ticker,
-            "fair_value_usd": fv_usd,
-            "fair_value_eur": fv_eur,
+            "fair_value_usd": round(fv_usd, 2),
+            "fair_value_eur": round(fv_eur, 2),
             "source": source,
             "updated_at": datetime.now().isoformat()
         }
         if existing:
             db.table("fair_values").update(data).eq("ticker", ticker).execute()
-            return "✅ Fair Value aktualisiert"
         else:
             db.table("fair_values").insert(data).execute()
-            return "✅ Fair Value gespeichert"
+        return True
     except Exception as e:
-        return f"❌ Fehler: {str(e)}"
-
-def export_to_csv(df: pd.DataFrame):
-    """Export Daten als CSV"""
-    csv = df.to_csv(index=False)
-    return csv
+        st.error(f"DB Fehler: {str(e)}")
+        return False
 
 def calculate_dcf_fair_value_eps(eps: float, growth_rate: float = 0.10) -> dict:
     if eps <= 0:
@@ -207,7 +201,7 @@ with st.sidebar:
     
     col_refresh, col_export = st.columns(2)
     with col_refresh:
-        if st.button("🔄 Cache leeren"):
+        if st.button("🔄 Neu laden"):
             st.cache_data.clear()
             st.rerun()
     
@@ -265,6 +259,7 @@ try:
         price_usd = info.get('currentPrice') or hist['Close'].iloc[-1]
         fv_usd = dcf_result.get('fv', 0)
         
+        # WICHTIG: Jedes mal vom DB laden, nicht cachen!
         db_fv = get_fair_value_from_db(t)
         if db_fv:
             fv_usd = db_fv.get('fair_value_usd', fv_usd)
@@ -311,13 +306,16 @@ try:
             return [''] * len(row)
 
         st.subheader("📊 Ranking")
-        st.dataframe(
-            df[["Ticker", "Kurs_EUR", "Fair_Value_EUR", "Upside_PCT", "RSI", "Signal"]]
-            .style.apply(highlight_rows, axis=1)
-            .format({"Kurs_EUR": "{:.2f}", "Fair_Value_EUR": "{:.2f}", "Upside_PCT": "{:.1f}", "RSI": "{:.1f}"}),
-            use_container_width=True,
-            hide_index=True
-        )
+        ranking_placeholder = st.empty()
+        
+        with ranking_placeholder.container():
+            st.dataframe(
+                df[["Ticker", "Kurs_EUR", "Fair_Value_EUR", "Upside_PCT", "RSI", "Signal"]]
+                .style.apply(highlight_rows, axis=1)
+                .format({"Kurs_EUR": "{:.2f}", "Fair_Value_EUR": "{:.2f}", "Upside_PCT": "{:.1f}", "RSI": "{:.1f}"}),
+                use_container_width=True,
+                hide_index=True
+            )
 
         st.divider()
 
@@ -342,7 +340,7 @@ try:
             
             with col_fv1:
                 new_fv_usd = st.number_input(
-                    f"Fair Value ({selected}):",
+                    f"Fair Value ({selected}) USD:",
                     value=row['_fv_usd'],
                     step=1.0,
                     min_value=0.1
@@ -351,10 +349,31 @@ try:
             with col_fv2:
                 if st.button("💾 Speichern", key=f"save_fv_{selected}"):
                     new_fv_eur = new_fv_usd / eur_usd
-                    msg = save_fair_value_to_db(selected, new_fv_usd, new_fv_eur, source="manual")
-                    st.success(msg)
-                    st.cache_data.clear()
-                    st.rerun()
+                    
+                    # Speichere in DB
+                    if save_fair_value_to_db(selected, new_fv_usd, new_fv_eur, source="manual"):
+                        st.success(f"✅ {selected} Fair Value aktualisiert!")
+                        
+                        # Aktualisiere nur diese Zeile im DF
+                        df.loc[df['Ticker'] == selected, 'Fair_Value_EUR'] = new_fv_eur
+                        df.loc[df['Ticker'] == selected, '_fv_usd'] = new_fv_usd
+                        df.loc[df['Ticker'] == selected, 'Upside_PCT'] = \
+                            ((new_fv_eur - df.loc[df['Ticker'] == selected, 'Kurs_EUR'].values[0]) / 
+                             df.loc[df['Ticker'] == selected, 'Kurs_EUR'].values[0]) * 100
+                        
+                        # Refresh nur die Ranking Tabelle
+                        with ranking_placeholder.container():
+                            st.dataframe(
+                                df[["Ticker", "Kurs_EUR", "Fair_Value_EUR", "Upside_PCT", "RSI", "Signal"]]
+                                .style.apply(highlight_rows, axis=1)
+                                .format({"Kurs_EUR": "{:.2f}", "Fair_Value_EUR": "{:.2f}", "Upside_PCT": "{:.1f}", "RSI": "{:.1f}"}),
+                                use_container_width=True,
+                                hide_index=True
+                            )
+                        
+                        time.sleep(0.5)
+                    else:
+                        st.error("❌ Fehler beim Speichern")
             
             st.divider()
             
