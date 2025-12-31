@@ -4,3 +4,4 @@ pandas
 pandas-ta
 supabase
 plotly
+yfinance>=0.2.40
