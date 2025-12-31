@@ -5,61 +5,62 @@ import pandas_ta as ta
 import plotly.graph_objects as go
 from supabase import create_client, Client
 
-# --- SETUP ---
-st.set_page_config(page_title="Stock Strategy Watchlist", layout="wide")
+# --- BASIS KONFIGURATION ---
+st.set_page_config(page_title="Stock Analysis Pro", layout="wide")
 
-# Supabase Verbindung
-try:
-    URL = st.secrets["SUPABASE_URL"]
-    KEY = st.secrets["SUPABASE_KEY"]
-    supabase: Client = create_client(URL, KEY)
-except Exception as e:
-    st.error("⚠️ Secrets fehlerhaft. Prüfe SUPABASE_URL und SUPABASE_KEY.")
-    st.stop()
+# Supabase Initialisierung
+@st.cache_resource
+def init_supabase():
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+        return create_client(url, key)
+    except Exception as e:
+        st.error(f"Verbindungsfehler: {e}")
+        return None
+
+supabase = init_supabase()
 
 # --- FUNKTIONEN ---
 
-def get_exchange_rate():
+def get_eur_usd():
     """Holt aktuellen EUR/USD Kurs."""
     try:
-        data = yf.download("EURUSD=X", period="1d", interval="1m", progress=False)
-        return data['Close'].iloc[-1]
+        return yf.download("EURUSD=X", period="1d", interval="1m", progress=False)['Close'].iloc[-1]
     except:
         return 1.05
 
-def get_analysis(ticker_symbol, eur_usd):
+def get_data(ticker, eur_usd):
     try:
-        tk = yf.Ticker(ticker_symbol)
-        info = tk.info
-        # Historie für ATH und Indikatoren
-        hist_full = tk.history(period="max")
-        hist_60d = hist_full.tail(60).copy()
+        tk = yf.Ticker(ticker)
+        # Schnellerer Abruf
+        hist = tk.history(period="max")
+        if hist.empty: return None
         
-        if hist_full.empty: return None
-
-        # 1. EPS 2026 Kalkulation
+        info = tk.info
+        hist_60d = hist.tail(60).copy()
+        
+        # Fair Value Kalkulation (Prompt-Logik)
         fwd_eps = info.get('forwardEps') or info.get('trailingEps') or 1.0
-        growth = info.get('earningsGrowth', 0.10) # Fallback 10%
+        growth = info.get('earningsGrowth', 0.1) 
         eps_2026 = fwd_eps * (1 + growth)**2
         
-        # 2. KGV Spanne (10J Median Proxy)
         kgv_median = info.get('forwardPE') or info.get('trailingPE') or 20
         unteres_kgv = kgv_median * 0.8
         
-        # 3. Fair Value (USD)
         fv_usd = (eps_2026 * unteres_kgv + eps_2026 * kgv_median) / 2
+        price_usd = info.get('currentPrice') or hist['Close'].iloc[-1]
         
-        # 4. Umrechnungen
-        price_usd = info.get('currentPrice') or hist_full['Close'].iloc[-1]
+        # Umrechnungen
         price_eur = price_usd / eur_usd
         fv_eur = fv_usd / eur_usd
         
         # ATH & Tranchen
-        ath_usd = hist_full['High'].max()
+        ath_usd = hist['High'].max()
         ath_eur = ath_usd / eur_usd
         corr_ath = ((price_usd - ath_usd) / ath_usd) * 100
         
-        # Technische Metriken
+        # Indikatoren
         rsi = ta.rsi(hist_60d['Close'], length=14).iloc[-1]
         adx = ta.adx(hist_60d['High'], hist_60d['Low'], hist_60d['Close'])['ADX_14'].iloc[-1]
         
@@ -67,7 +68,7 @@ def get_analysis(ticker_symbol, eur_usd):
         vol_ma = hist_60d['Volume'].mean()
         vol_sig = "Buy" if vol_now > (vol_ma * 1.5) else "Sell" if vol_now < (vol_ma * 0.8) else "Hold"
         
-        # Bewertung Logik
+        # Bewertung
         upside = ((fv_usd - price_usd) / price_usd) * 100
         if upside > 10 and rsi < 40 and vol_sig == "Buy":
             bewertung = "🟢 KAUF"
@@ -77,82 +78,86 @@ def get_analysis(ticker_symbol, eur_usd):
             bewertung = "🔴 WARTEN"
 
         return {
-            "Ticker": ticker_symbol,
+            "Ticker": ticker,
             "Kurs(€)": round(float(price_eur), 2),
             "Fair Value(USD)": round(float(fv_usd), 2),
             "Fair Value(€)": round(float(fv_eur), 2),
-            "Tranche1(-10%ATH)": round(float(ath_eur * 0.9), 2),
-            "Tranche2(-20%ATH)": round(float(ath_eur * 0.8), 2),
+            "Tranche1(-10%)": round(float(ath_eur * 0.9), 2),
+            "Tranche2(-20%)": round(float(ath_eur * 0.8), 2),
             "Bewertung": bewertung,
-            "RSI(14)": round(float(rsi), 1),
-            "Korrektur vs ATH(%)": f"{round(float(corr_ath), 1)}%",
-            "Trendstärke": "Stark" if adx > 25 else "Mittel" if adx > 20 else "Schwach",
+            "RSI": round(float(rsi), 1),
+            "Korrektur": f"{round(float(corr_ath), 1)}%",
+            "Trend": "Stark" if adx > 25 else "Mittel" if adx > 20 else "Schwach",
             "Volumen": vol_sig
         }
     except:
         return None
 
 # --- UI ---
-st.title("📈 Watchlist Analyse Tool")
+st.title("📈 Strategy App: Watchlist")
 
-# Verbindungstest & Datenabruf
-try:
-    # Abfrage der Tabelle 'watchlist'
-    query = supabase.table("watchlist").select("ticker").execute()
-    tickers = [item['ticker'] for item in query.data]
-except Exception as e:
-    st.error(f"Fehler beim Zugriff auf Tabelle 'watchlist': {e}")
-    st.info("💡 Tipp: Prüfe in Supabase, ob RLS (Row Level Security) deaktiviert ist oder eine 'SELECT' Policy für anonyme Nutzer existiert.")
-    tickers = []
-
-if tickers:
-    eur_usd = get_exchange_rate()
-    st.write(f"Währungsbasis: 1 EUR = {round(eur_usd, 4)} USD")
-    
-    results = []
-    with st.spinner('Berechne Kennzahlen...'):
-        for t in tickers:
-            res = get_analysis(t, eur_usd)
-            if res: results.append(res)
-    
-    if results:
-        df = pd.DataFrame(results)
+if supabase:
+    # Daten abrufen
+    try:
+        # Explizite Abfrage
+        response = supabase.from_("watchlist").select("ticker").execute()
+        ticker_list = [t['ticker'].strip() for t in response.data]
         
-        # Tabellenanzeige
-        st.subheader("Analyse-Ergebnisse")
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        if not ticker_list:
+            st.warning("⚠️ Tabelle 'watchlist' ist leer. Bitte Ticker hinzufügen.")
+            st.stop()
+            
+        eur_usd = get_eur_usd()
+        st.write(f"Wechselkurs: **1 EUR = {round(eur_usd, 4)} USD**")
         
-        # Charts
-        st.divider()
-        st.subheader("Fair Value Visualisierung (€)")
-        cols = st.columns(3)
-        for i, row in df.iterrows():
-            with cols[i % 3]:
-                fig = go.Figure(go.Indicator(
-                    mode = "gauge+number",
-                    value = row['Kurs(€)'],
-                    title = {'text': f"{row['Ticker']}"},
-                    gauge = {
-                        'axis': {'range': [0, max(row['Fair Value(€)'], row['Kurs(€)']) * 1.5]},
-                        'bar': {'color': "darkblue"},
-                        'steps': [
-                            {'range': [0, row['Fair Value(€)']], 'color': "#d4edda"},
-                            {'range': [row['Fair Value(€)'], 9999], 'color': "#f8d7da"}
-                        ],
-                        'threshold': {
-                            'line': {'color': "green", 'width': 4},
-                            'value': row['Fair Value(€)']
+        results = []
+        with st.spinner('Berechne Kennzahlen...'):
+            for t in ticker_list:
+                res = get_data(t, eur_usd)
+                if res: results.append(res)
+        
+        if results:
+            df = pd.DataFrame(results)
+            
+            # 1. Tabelle
+            st.subheader("Analyse Übersicht")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            
+            # 2. Charts
+            st.divider()
+            st.subheader("Kurs vs. Fair Value (€)")
+            cols = st.columns(3)
+            for i, row in df.iterrows():
+                with cols[i % 3]:
+                    fig = go.Figure(go.Indicator(
+                        mode = "gauge+number",
+                        value = row['Kurs(€)'],
+                        title = {'text': f"{row['Ticker']}"},
+                        gauge = {
+                            'axis': {'range': [0, max(row['Fair Value(€)'], row['Kurs(€)']) * 1.4]},
+                            'steps': [
+                                {'range': [0, row['Fair Value(€)']], 'color': "#E8F5E9"},
+                                {'range': [row['Fair Value(€)'], 9999], 'color': "#FFEBEE"}
+                            ],
+                            'threshold': {'line': {'color': "green", 'width': 4}, 'value': row['Fair Value(€)']}
                         }
-                    }
-                ))
-                fig.update_layout(height=250)
-                st.plotly_chart(fig, use_container_width=True)
-else:
-    if not tickers:
-        st.warning("Tabelle 'watchlist' gefunden, aber sie enthält keine Einträge.")
+                    ))
+                    fig.update_layout(height=220, margin=dict(l=10,r=10,t=40,b=10))
+                    st.plotly_chart(fig, use_container_width=True)
 
-# Sidebar Controls
+    except Exception as e:
+        st.error(f"Fehler beim Laden der Tabelle 'watchlist': {e}")
+        st.info("💡 Prüfe, ob die Tabelle wirklich 'watchlist' (kleingeschrieben) heißt.")
+
+# Sidebar Admin
 with st.sidebar:
-    st.header("Einstellungen")
-    if st.button("Daten neu laden"):
+    st.header("Steuerung")
+    if st.button("🔄 Aktualisieren"):
         st.rerun()
+    
+    new_ticker = st.text_input("Neuer Ticker (z.B. TSLA)")
+    if st.button("Hinzufügen"):
+        if new_ticker:
+            supabase.table("watchlist").insert({"ticker": new_ticker.upper()}).execute()
+            st.success(f"{new_ticker} hinzugefügt!")
+            st.rerun()
