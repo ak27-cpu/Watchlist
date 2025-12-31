@@ -7,10 +7,6 @@ from supabase import create_client, Client
 # --- SETUP & CONFIG ---
 st.set_page_config(page_title="Aktien Watchlist PRO", layout="wide")
 
-# Supabase Verbindung (Ersetze mit deinen Credentials oder nutze st.secrets)
-SUPABASE_URL = "DEINE_SUPABASE_URL"
-SUPABASE_KEY = "DEIN_SUPABASE_KEY"
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 TICKERS = ["NVDA", "TSM", "V", "ASML", "GOOGL"]
 
